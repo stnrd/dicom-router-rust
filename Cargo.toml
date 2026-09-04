@@ -46,7 +46,7 @@ slog-async = "2"
 # Logging bridges (for interop with the tokio/tracing ecosystem)
 log = "0.4"
 slog-stdlog = "4"
-tracing-slog = "0.4"
+tracing = { version = "0.1", features = ["log"] }
 
 # Error handling
 snafu = "0.9"
