@@ -46,6 +46,7 @@ slog-async = "2"
 # Logging bridges (for interop with the tokio/tracing ecosystem)
 log = "0.4"
 slog-stdlog = "4"
+slog-scope = "4"
 tracing = { version = "0.1", features = ["log"] }
 
 # Error handling
@@ -58,6 +59,7 @@ fs4 = "1" # available disk space check
 [dev-dependencies]
 tempfile = "3"
 rcgen = "0.13"
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
