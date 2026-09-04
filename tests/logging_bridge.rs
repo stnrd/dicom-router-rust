@@ -11,6 +11,12 @@ use dicom_router::logging;
 fn bridge_install_does_not_panic_and_logger_still_works() {
     let (log, _guard) = logging::init_logger(slog::Level::Info);
 
+    assert_eq!(
+        log::max_level(),
+        log::LevelFilter::Info,
+        "bridge should install a log backend filtered at the requested level"
+    );
+
     // A bridged `log` record must be accepted without panicking, even though the
     // underlying `log` backend can only be installed once per process.
     log::warn!("bridge test");

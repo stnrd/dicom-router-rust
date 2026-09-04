@@ -42,13 +42,13 @@ clap = { version = "4", features = ["derive"] }
 slog = "2"
 slog-json = "2"
 slog-async = "2"
+time = { version = "0.3", features = ["formatting"] } # RFC 3339 timestamps for the JSON "ts" key
 
 # Logging bridges (for interop with the tokio/tracing ecosystem)
 log = "0.4"
 slog-stdlog = "4"
 slog-scope = "4"
 tracing = { version = "0.1", features = ["log"] }
-time = { version = "0.3", features = ["formatting"] }
 
 # Error handling
 snafu = "0.9"

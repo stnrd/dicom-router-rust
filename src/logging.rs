@@ -13,10 +13,11 @@ const SERVICE: &str = "dicom-router";
 
 /// Build the shared JSON key-value drain used by both [`build_logger`] and [`init_logger`].
 ///
-/// Emits `ts` (RFC 3339 UTC timestamp), `level` (full name, e.g. `"ERROR"`, matching Go slog
-/// semantics rather than slog-json's default 4-char short names), `msg`, and `src` (the `log`
-/// target for bridged dependency records, or the Rust module path for records logged natively
-/// through this crate's loggers).
+/// Emits `ts` (RFC 3339 UTC timestamp), `level` (Go slog's level strings, e.g. `"WARN"` and
+/// `"ERROR"` — neither slog-json's default 4-char short names like `"WARN"`/`"ERRO"` nor
+/// slog's own long names like `"WARNING"`), `msg`, and `src` (the `log` target for bridged
+/// dependency records, or the Rust module path for records logged natively through this
+/// crate's loggers).
 ///
 /// Write errors are ignored (`ignore_res`) rather than fused into a panic: a transient stdout
 /// error must not kill the async worker thread in [`init_logger`] and permanently disable
@@ -32,10 +33,21 @@ where
                     .format(&time::format_description::well_known::Rfc3339)
                     .ok()
             }),
-            "level" => FnValue(|r: &Record| r.level().as_str()),
+            // Explicit table (not `Level::as_str()`) so `Warning` renders as Go slog's "WARN"
+            // rather than slog's own "WARNING".
+            "level" => FnValue(|r: &Record| match r.level() {
+                slog::Level::Critical => "CRITICAL",
+                slog::Level::Error => "ERROR",
+                slog::Level::Warning => "WARN",
+                slog::Level::Info => "INFO",
+                slog::Level::Debug => "DEBUG",
+                slog::Level::Trace => "TRACE",
+            }),
             "msg" => PushFnValue(|r: &Record, ser| ser.emit(r.msg())),
-            "src" => FnValue(|r: &Record| {
-                if r.tag().is_empty() { r.module().to_string() } else { r.tag().to_string() }
+            // PushFnValue serializes directly, avoiding a per-record String allocation that
+            // FnValue would require to unify the `&str` lifetimes of `tag()` and `module()`.
+            "src" => PushFnValue(|r: &Record, ser| {
+                ser.emit(if r.tag().is_empty() { r.module() } else { r.tag() })
             }),
         ))
         .build()
@@ -56,11 +68,18 @@ where
     Logger::root(drain.filter_level(level).fuse(), o!("service" => SERVICE))
 }
 
-/// Returned by [`init_logger`]. Dropping it uninstalls the global logger, after
-/// which any bridged `log`/`tracing` record from a dependency will PANIC.
-/// Keep it alive for the process lifetime.
-#[must_use = "dropping the guard uninstalls the global logger and makes bridged records panic"]
-pub struct LoggerGuard(#[allow(dead_code)] slog_scope::GlobalLoggerGuard);
+/// Returned by [`init_logger`]. Its `Drop` impl flushes and joins the async drain's
+/// background worker thread, guaranteeing buffered records are written before the
+/// process exits.
+///
+/// The global logger installed by `init_logger` is never uninstalled (slog-scope's
+/// fallback drain panics on every record, so resetting it on drop would turn a normal
+/// shutdown into a crash) — dropping this guard early does NOT panic. It just means
+/// any record logged afterwards is silently dropped rather than reaching stdout, since
+/// the worker thread that writes JSON has already stopped. Keep it alive for the
+/// process lifetime to avoid losing buffered records.
+#[must_use = "dropping the guard early may silently lose log records; keep it alive until shutdown"]
+pub struct LoggerGuard(#[allow(dead_code)] slog_async::AsyncGuard);
 
 /// Ensures the `log` -> slog-scope bridge is installed at most once per process.
 static STDLOG_INIT: Once = Once::new();
@@ -72,9 +91,8 @@ static STDLOG_INIT: Once = Once::new();
 ///   (the `tracing/log` feature is enabled in Cargo.toml)
 ///
 /// Both are captured by slog-stdlog into the slog-scope global logger.
-/// Returns a [`LoggerGuard`]: THE CALLER MUST KEEP IT ALIVE for the
-/// process lifetime, otherwise bridged records are dropped and any further
-/// bridged record will PANIC (see [`LoggerGuard`]).
+/// Returns a [`LoggerGuard`]: THE CALLER MUST KEEP IT ALIVE for the process lifetime,
+/// otherwise buffered records may be lost (see [`LoggerGuard`] for the exact semantics).
 ///
 /// The `log` crate backend can only be installed once per process; on the first call this
 /// installs it filtered at `level` (mapped to the nearest `log::Level`), and that filter
@@ -88,19 +106,22 @@ pub fn init_logger(level: slog::Level) -> (Logger, LoggerGuard) {
     let drain = json_drain(std::io::stdout());
     // Drop rather than block on overflow: blocking would stall a tokio worker
     // thread on stdout I/O. DropAndReport emits a record with the dropped count.
-    let drain = slog_async::Async::new(drain)
+    let (drain, async_guard) = slog_async::Async::new(drain)
         .chan_size(4096)
         .overflow_strategy(slog_async::OverflowStrategy::DropAndReport)
         .thread_name("slog-async".into())
-        .build()
-        .fuse();
-    let log = Logger::root(drain.filter_level(level).fuse(), o!("service" => SERVICE));
-    let guard = LoggerGuard(slog_scope::set_global_logger(log.clone()));
+        .build_with_guard();
+    let log = Logger::root(
+        drain.fuse().filter_level(level).fuse(),
+        o!("service" => SERVICE),
+    );
+    // Never uninstall the global logger: slog-scope's fallback drain panics on every
+    // record, so a dropped guard would turn a shutdown into a crash.
+    slog_scope::set_global_logger(log.clone()).cancel_reset();
 
     STDLOG_INIT.call_once(|| {
         let log_level = match level {
-            slog::Level::Critical => log::Level::Error,
-            slog::Level::Error => log::Level::Error,
+            slog::Level::Critical | slog::Level::Error => log::Level::Error,
             slog::Level::Warning => log::Level::Warn,
             slog::Level::Info => log::Level::Info,
             slog::Level::Debug => log::Level::Debug,
@@ -109,11 +130,13 @@ pub fn init_logger(level: slog::Level) -> (Logger, LoggerGuard) {
         slog_stdlog::init_with_level(log_level).expect("failed to install slog-stdlog bridge");
     });
 
-    (log, guard)
+    (log, LoggerGuard(async_guard))
 }
 
-/// Parse a log level name (case-insensitive, long or short form, e.g. `"warn"` or `"WARNING"`).
-/// Returns `None` on invalid input.
+/// Parse a log level name. Matching is case-insensitive and by prefix against the long
+/// (`"warning"`) or short (`"warn"`) canonical names, so `"warn"`, `"WARNING"`, and `"warni"`
+/// all resolve to `Warning`. Returns `None` for `"off"` (slog's `Level` has no such variant)
+/// or any other unrecognized input.
 pub fn parse_level(s: &str) -> Option<slog::Level> {
     s.parse().ok()
 }
@@ -157,6 +180,17 @@ mod tests {
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(line["level"], "ERROR");
+    }
+
+    #[test]
+    fn emits_go_slog_level_name_for_warning() {
+        let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let log = build_logger(buf.clone(), slog::Level::Info);
+        slog::warn!(log, "careful");
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        // Go slog uses "WARN", not slog's own "WARNING".
+        assert_eq!(line["level"], "WARN");
     }
 
     #[test]
