@@ -61,6 +61,14 @@ fs4 = "1" # available disk space check
 tempfile = "3"
 rcgen = "0.13"
 serde_json = "1"
+dicom-object = "0.10"
+dicom-encoding = "0.10"
+dicom-transfer-syntax-registry = "0.10"
+dicom-dictionary-std = "0.10"
+dicom-core = "0.10"
+dicom-ul = { version = "0.10", features = ["async-tls"] }
+slog = "2"
+serde_yaml = "0.9"
 
 [profile.release]
 lto = "thin"
