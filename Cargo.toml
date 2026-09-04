@@ -48,6 +48,7 @@ log = "0.4"
 slog-stdlog = "4"
 slog-scope = "4"
 tracing = { version = "0.1", features = ["log"] }
+time = { version = "0.3", features = ["formatting"] }
 
 # Error handling
 snafu = "0.9"

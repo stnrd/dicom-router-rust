@@ -368,6 +368,7 @@ dependencies = [
  "slog-stdlog",
  "snafu",
  "tempfile",
+ "time",
  "tokio",
  "tokio-util",
  "tracing",
