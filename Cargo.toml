@@ -1,0 +1,53 @@
+[package]
+name = "dicom-router"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dicom_router"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dicom-router"
+path = "src/main.rs"
+
+[dependencies]
+# DICOM ecosystem (workspace-locked 0.10 line)
+dicom-core = "0.10"
+dicom-dictionary-std = "0.10"
+dicom-object = "0.10"
+dicom-encoding = "0.10"
+dicom-transfer-syntax-registry = { version = "0.10", features = ["native"] }
+dicom-ul = { version = "0.10", features = ["async-tls"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# TLS (MUST stay on 0.23 to match dicom-ul's rustls types)
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# Config (YAML for Kubernetes ConfigMaps)
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Structured JSON logging (Go slog-style: msg field)
+slog = "2"
+slog-json = "2"
+slog-async = "2"
+
+# Error handling
+snafu = "0.8"
+
+# Queue
+notify = "8"
+uuid = { version = "1", features = ["v4"] }
+fs2 = "0.4" # available disk space check
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.13"
