@@ -2,6 +2,9 @@
 name = "dicom-router"
 version = "0.1.0"
 edition = "2021"
+description = "Secure TLS-only DICOM C-STORE router"
+publish = false
+rust-version = "1.85"
 
 [lib]
 name = "dicom_router"
@@ -17,7 +20,7 @@ dicom-core = "0.10"
 dicom-dictionary-std = "0.10"
 dicom-object = "0.10"
 dicom-encoding = "0.10"
-dicom-transfer-syntax-registry = { version = "0.10", features = ["native"] }
+dicom-transfer-syntax-registry = "0.10"
 dicom-ul = { version = "0.10", features = ["async-tls"] }
 
 # Async runtime
@@ -25,7 +28,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 
 # TLS (MUST stay on 0.23 to match dicom-ul's rustls types)
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 
 # Config (YAML for Kubernetes ConfigMaps)
@@ -40,14 +43,22 @@ slog = "2"
 slog-json = "2"
 slog-async = "2"
 
+# Logging bridges (for interop with the tokio/tracing ecosystem)
+log = "0.4"
+slog-stdlog = "4"
+tracing-slog = "0.4"
+
 # Error handling
-snafu = "0.8"
+snafu = "0.9"
 
 # Queue
 notify = "8"
-uuid = { version = "1", features = ["v4"] }
-fs2 = "0.4" # available disk space check
+fs4 = "1" # available disk space check
 
 [dev-dependencies]
 tempfile = "3"
 rcgen = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
