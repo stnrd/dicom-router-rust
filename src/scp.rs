@@ -311,11 +311,17 @@ where
             "no destination configured for calling AE {calling_ae:?}"
         ));
     }
-    for dest in destinations {
-        let dir = cfg.queue_dir_for(&dest.name);
-        queue::enqueue(&dir, &file_obj, cfg.min_free_bytes)
-            .map_err(|e| format!("spool to {:?} failed: {e}", dest.name))?;
-    }
+    let dirs: Vec<std::path::PathBuf> = destinations
+        .iter()
+        .map(|dest| cfg.queue_dir_for(&dest.name))
+        .collect();
+    let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
+    queue::enqueue_fanout(&dir_refs, &file_obj, cfg.min_free_bytes).map_err(|e| {
+        format!(
+            "spool failed for {} destination(s): {e}",
+            destinations.len()
+        )
+    })?;
     info!(
         log,
         "object spooled";

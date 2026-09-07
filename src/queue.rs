@@ -97,6 +97,53 @@ pub fn enqueue(
     Ok(dcm_final)
 }
 
+/// Remove a committed spool entry (`.dcm` + `.yaml`). Used to roll back a
+/// partial fan-out when a later destination enqueue fails.
+///
+/// Best-effort and idempotent: missing files are ignored. Returns the first I/O
+/// error encountered while removing files that do exist.
+pub fn rollback(dcm_path: &Path) -> Result<()> {
+    let sidecar_path = dcm_path.with_extension("yaml");
+    let dcm_err = std::fs::remove_file(dcm_path).err();
+    let sc_err = std::fs::remove_file(&sidecar_path).err();
+    match (dcm_err, sc_err) {
+        (Some(e), _) if e.kind() != std::io::ErrorKind::NotFound => Err(QueueError::Io {
+            path: dcm_path.to_path_buf(),
+            source: e,
+        }),
+        (_, Some(e)) if e.kind() != std::io::ErrorKind::NotFound => Err(QueueError::Io {
+            path: sidecar_path,
+            source: e,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Atomically spool `obj` to every directory in `dirs`.
+///
+/// On success, returns the final `.dcm` path for each directory. On any
+/// failure, rolls back all destinations that were already written and returns
+/// the error from the failing `enqueue` call.
+pub fn enqueue_fanout(
+    dirs: &[&Path],
+    obj: &FileDicomObject<InMemDicomObject>,
+    min_free_bytes: u64,
+) -> Result<Vec<PathBuf>> {
+    let mut committed = Vec::new();
+    for dir in dirs {
+        match enqueue(dir, obj, min_free_bytes) {
+            Ok(path) => committed.push(path),
+            Err(e) => {
+                for path in &committed {
+                    let _ = rollback(path);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(committed)
+}
+
 fn fsync_file(path: &Path) -> Result<()> {
     std::fs::File::open(path)
         .map_err(io(path))?
@@ -240,6 +287,52 @@ mod tests {
         let pending = scan(dir.path()).unwrap();
         assert_eq!(pending[0].attempts, 1);
         assert_eq!(pending[0].last_error.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn rollback_removes_dcm_and_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let obj = test_object("7.7.7");
+        let path = enqueue(dir.path(), &obj, 0).unwrap();
+        assert!(path.exists());
+        rollback(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!path.with_extension("yaml").exists());
+        assert!(scan(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enqueue_fanout_all_or_nothing_on_disk_full() {
+        let root = tempfile::tempdir().unwrap();
+        let ok_dir = root.path().join("dest-a");
+        let full_dir = root.path().join("dest-b");
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        std::fs::create_dir_all(&full_dir).unwrap();
+
+        let obj = test_object("8.8.8");
+        let dirs = [ok_dir.as_path(), full_dir.as_path()];
+
+        let result = enqueue_fanout(&dirs, &obj, u64::MAX);
+        assert!(result.is_err(), "second destination should fail disk check");
+
+        assert!(scan(&ok_dir).unwrap().is_empty());
+        assert!(scan(&full_dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enqueue_fanout_succeeds_for_all_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        let dir_a = root.path().join("dest-a");
+        let dir_b = root.path().join("dest-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let obj = test_object("9.9.9");
+        let dirs = [dir_a.as_path(), dir_b.as_path()];
+        let paths = enqueue_fanout(&dirs, &obj, 0).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(scan(&dir_a).unwrap().len(), 1);
+        assert_eq!(scan(&dir_b).unwrap().len(), 1);
     }
 
     #[test]
