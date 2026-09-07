@@ -195,7 +195,9 @@ where
               data_value.presentation_context_id,
               &instance_buffer,
               &log,
-            ) {
+            )
+            .await
+            {
               Ok(()) => dimse::STATUS_SUCCESS,
               Err(e) => {
                 error!(
@@ -249,7 +251,7 @@ where
   Ok(())
 }
 
-fn store_instance<S>(
+async fn store_instance<S>(
   cfg: &Config,
   association: &AsyncServerAssociation<S>,
   pc_id: u8,
@@ -296,9 +298,15 @@ where
     return Err(format!("no destination configured for calling AE {calling_ae:?}"));
   }
   let dirs: Vec<std::path::PathBuf> = destinations.iter().map(|dest| cfg.queue_dir_for(&dest.name)).collect();
-  let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
-  queue::enqueue_fanout(&dir_refs, &file_obj, cfg.min_free_bytes)
-    .map_err(|e| format!("spool failed for {} destination(s): {e}", destinations.len()))?;
+  let dest_count = destinations.len();
+  let min_free_bytes = cfg.min_free_bytes;
+  tokio::task::spawn_blocking(move || {
+    let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
+    queue::enqueue_fanout(&dir_refs, &file_obj, min_free_bytes)
+  })
+  .await
+  .map_err(|e| format!("spool task panicked: {e}"))?
+  .map_err(|e| format!("spool failed for {dest_count} destination(s): {e}"))?;
   info!(
       log,
       "object spooled";

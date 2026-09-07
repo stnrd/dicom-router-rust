@@ -31,7 +31,13 @@ pub fn spawn(
   tokio::spawn(async move {
     let log = log.new(o!("destination" => destination.name.clone()));
     let dir = queue_root.join(&destination.name);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    if let Err(e) = tokio::task::spawn_blocking({
+      let dir = dir.clone();
+      move || std::fs::create_dir_all(&dir)
+    })
+    .await
+    .expect("create_dir_all task panicked")
+    {
       error!(log, "cannot create queue directory"; "dir" => %dir.display(), "error" => %e);
       return;
     }
@@ -70,7 +76,13 @@ pub fn spawn(
           _ = rx.recv() => {}
       }
 
-      let pending = match queue::scan(&dir) {
+      let pending = match tokio::task::spawn_blocking({
+        let dir = dir.clone();
+        move || queue::scan(&dir)
+      })
+      .await
+      .expect("scan task panicked")
+      {
         Ok(p) => p,
         Err(e) => {
           error!(log, "queue scan failed"; "error" => %e);
@@ -84,7 +96,14 @@ pub fn spawn(
           break;
         }
         if spooled.attempts >= retry_cfg.max_attempts {
-          match queue::move_to_dead_letter(&spooled, &dead_letter_dir) {
+          match tokio::task::spawn_blocking({
+            let spooled = spooled.clone();
+            let dead_letter_dir = dead_letter_dir.clone();
+            move || queue::move_to_dead_letter(&spooled, &dead_letter_dir)
+          })
+          .await
+          .expect("dead-letter task panicked")
+          {
             Ok(()) => error!(
                 log,
                 "object dead-lettered after retries";
@@ -116,7 +135,10 @@ pub fn spawn(
         sends.spawn(async move {
           let _permit = permit;
           if spooled.delivered {
-            if let Err(e) = queue::acknowledge(&spooled) {
+            if let Err(e) = tokio::task::spawn_blocking(move || queue::acknowledge(&spooled))
+              .await
+              .expect("acknowledge task panicked")
+            {
               error!(
                   slog,
                   "delivered but failed to delete spool file";
@@ -127,14 +149,23 @@ pub fn spawn(
           }
           match scu::forward(&dest, tls, &spooled, &ae, max_pdu_length, &slog).await {
             Ok(()) => {
-              if let Err(e) = queue::mark_delivered(&spooled) {
+              if let Err(e) = tokio::task::spawn_blocking({
+                let spooled = spooled.clone();
+                move || queue::mark_delivered(&spooled)
+              })
+              .await
+              .expect("mark_delivered task panicked")
+              {
                 error!(
                     slog,
                     "forwarded but failed to mark delivered";
                     "error" => %e
                 );
               }
-              if let Err(e) = queue::acknowledge(&spooled) {
+              if let Err(e) = tokio::task::spawn_blocking(move || queue::acknowledge(&spooled))
+                .await
+                .expect("acknowledge task panicked")
+              {
                 error!(
                     slog,
                     "forwarded but failed to delete spool file";
@@ -150,7 +181,10 @@ pub fn spawn(
                   "attempt" => spooled.attempts + 1,
                   "error" => %e
               );
-              if let Err(e2) = queue::record_failure(&spooled, &e.to_string()) {
+              if let Err(e2) = tokio::task::spawn_blocking(move || queue::record_failure(&spooled, &e.to_string()))
+                .await
+                .expect("record_failure task panicked")
+              {
                 error!(slog, "failed to record retry state"; "error" => %e2);
               }
             }
