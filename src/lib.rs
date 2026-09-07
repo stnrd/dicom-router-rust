@@ -99,18 +99,18 @@ async fn async_main(cfg: config::Config, log: slog::Logger) -> i32 {
           return 2;
         }
       };
-    dispatcher_handles.push(dispatcher::spawn(
-      dest.clone(),
+    dispatcher_handles.push(dispatcher::spawn(dispatcher::WorkerConfig {
+      destination: dest.clone(),
       client_tls,
-      cfg.queue_dir.clone(),
-      cfg.dead_letter_dir.clone(),
-      cfg.retry.clone(),
-      cfg.ae_title.clone(),
-      cfg.max_pdu_length,
-      cfg.max_concurrent_sends,
-      log.clone(),
-      shutdown.clone(),
-    ));
+      queue_root: cfg.queue_dir.clone(),
+      dead_letter_dir: cfg.dead_letter_dir.clone(),
+      retry_cfg: cfg.retry.clone(),
+      calling_ae_title: cfg.ae_title.clone(),
+      max_pdu_length: cfg.max_pdu_length,
+      max_concurrent_sends: cfg.max_concurrent_sends,
+      log: log.clone(),
+      shutdown: shutdown.clone(),
+    }));
   }
 
   info!(

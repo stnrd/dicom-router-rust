@@ -15,20 +15,35 @@ use crate::{queue, scu};
 
 const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-#[allow(clippy::too_many_arguments)]
-pub fn spawn(
-  destination: Destination,
-  client_tls: Arc<rustls::ClientConfig>,
-  queue_root: PathBuf,
-  dead_letter_dir: PathBuf,
-  retry_cfg: RetryConfig,
-  calling_ae_title: String,
-  max_pdu_length: u32,
-  max_concurrent_sends: usize,
-  log: Logger,
-  shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+/// Configuration for one per-destination dispatcher worker.
+pub struct WorkerConfig {
+  pub destination:          Destination,
+  pub client_tls:         Arc<rustls::ClientConfig>,
+  pub queue_root:           PathBuf,
+  pub dead_letter_dir:      PathBuf,
+  pub retry_cfg:            RetryConfig,
+  pub calling_ae_title:     String,
+  pub max_pdu_length:       u32,
+  pub max_concurrent_sends: usize,
+  pub log:                  Logger,
+  pub shutdown:             CancellationToken,
+}
+
+pub fn spawn(config: WorkerConfig) -> tokio::task::JoinHandle<()> {
   tokio::spawn(async move {
+    let WorkerConfig {
+      destination,
+      client_tls,
+      queue_root,
+      dead_letter_dir,
+      retry_cfg,
+      calling_ae_title,
+      max_pdu_length,
+      max_concurrent_sends,
+      log,
+      shutdown,
+    } = config;
+
     let log = log.new(o!("destination" => destination.name.clone()));
     let dir = queue_root.join(&destination.name);
     if let Err(e) = tokio::task::spawn_blocking({
