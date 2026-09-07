@@ -11,14 +11,52 @@ use dicom_ul::association::{Association, AsyncServerAssociation};
 use dicom_ul::pdu::{PDataValue, PDataValueType, PresentationContextResultReason};
 use dicom_ul::Pdu;
 use slog::{debug, error, info, o, warn, Logger};
-use snafu::{Report, ResultExt, Whatever};
+use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::dimse::{self, CommandSet, TAG_AFFECTED_SOP_CLASS_UID, TAG_AFFECTED_SOP_INSTANCE_UID, TAG_MESSAGE_ID};
-use crate::queue;
+use crate::queue::{self, QueueError};
+
+#[derive(Debug, Snafu)]
+pub enum ScpError {
+  #[snafu(display("missing presentation context for incoming C-STORE"))]
+  MissingPresentationContext,
+
+  #[snafu(display("unsupported transfer syntax {ts_uid}"))]
+  UnsupportedTransferSyntax { ts_uid: String },
+
+  #[snafu(display("failed to read dataset: {source}"))]
+  ReadDataset { source: Box<dicom_object::ReadError> },
+
+  #[snafu(display("missing SOP Class UID in dataset"))]
+  MissingSopClassUid,
+
+  #[snafu(display("missing SOP Instance UID in dataset"))]
+  MissingSopInstanceUid,
+
+  #[snafu(display("failed to build DICOM file meta: {reason}"))]
+  BuildFileMeta { reason: String },
+
+  #[snafu(display("no destination configured for calling AE {calling_ae}"))]
+  NoDestination { calling_ae: String },
+
+  #[snafu(display("spool task panicked: {source}"))]
+  SpoolTaskPanicked { source: tokio::task::JoinError },
+
+  #[snafu(display("spool failed for {destination_count} destination(s): {source}"))]
+  Spool {
+    destination_count: usize,
+    source:            QueueError,
+  },
+
+  #[snafu(display("could not send response PDU: {source}"))]
+  SendPdu { source: Box<dicom_ul::association::Error> },
+}
+
+type Result<T> = std::result::Result<T, ScpError>;
 
 /// Storage SOP classes accepted by default.
 pub const ABSTRACT_SYNTAXES: &[&str] = &[
@@ -112,12 +150,12 @@ pub async fn spawn(
                                   .count() as u64
                           );
                           if let Err(e) = handle_association(association, &cfg, alog.clone()).await {
-                              warn!(alog, "association ended with error"; "error" => %Report::from_error(e));
+                              warn!(alog, "association ended with error"; "error" => %e);
                           }
                           info!(alog, "association closed");
                       }
                       Err(e) => {
-                          debug!(conn_log, "association rejected"; "error" => %Report::from_error(e));
+                          debug!(conn_log, "association rejected"; "error" => %e);
                       }
                   }
               });
@@ -134,7 +172,7 @@ async fn handle_association<S>(
   mut association: AsyncServerAssociation<S>,
   cfg: &Config,
   log: Logger,
-) -> Result<(), Whatever>
+) -> Result<()>
 where
   S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -148,7 +186,7 @@ where
       Ok(p) => p,
       Err(dicom_ul::association::Error::ReceivePdu { .. }) => break,
       Err(e) => {
-        warn!(log, "unexpected receive error"; "error" => %Report::from_error(e));
+        warn!(log, "unexpected receive error"; "error" => %e);
         break;
       }
     };
@@ -232,7 +270,7 @@ async fn send_command<S>(
   association: &mut AsyncServerAssociation<S>,
   cmd: &CommandSet,
   pc_id: u8,
-) -> Result<(), Whatever>
+) -> Result<()>
 where
   S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -247,7 +285,9 @@ where
       }],
     })
     .await
-    .whatever_context("could not send response PDU")?;
+    .map_err(|source| ScpError::SendPdu {
+      source: Box::new(source),
+    })?;
   Ok(())
 }
 
@@ -257,7 +297,7 @@ async fn store_instance<S>(
   pc_id: u8,
   dataset: &[u8],
   log: &Logger,
-) -> Result<(), String>
+) -> Result<()>
 where
   S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -265,37 +305,43 @@ where
     .presentation_contexts()
     .iter()
     .find(|pc| pc.id == pc_id)
-    .ok_or_else(|| "missing presentation context".to_string())?;
+    .context(MissingPresentationContextSnafu)?;
   let ts_uid = &pc.transfer_syntax;
   let ts = TransferSyntaxRegistry
     .get(ts_uid)
-    .ok_or_else(|| format!("unsupported transfer syntax {ts_uid}"))?;
+    .context(UnsupportedTransferSyntaxSnafu {
+      ts_uid: ts_uid.clone(),
+    })?;
 
-  let obj = InMemDicomObject::read_dataset_with_ts(dataset, ts).map_err(|e| format!("failed to read dataset: {e}"))?;
+  let obj = InMemDicomObject::read_dataset_with_ts(dataset, ts).map_err(|e| ScpError::ReadDataset {
+    source: Box::new(e),
+  })?;
   let sop_class = obj
     .element(dicom_dictionary_std::tags::SOP_CLASS_UID)
     .ok()
     .and_then(|e| e.to_str().ok())
     .map(|s| s.trim_end_matches(['\0', ' ']).to_string())
-    .ok_or_else(|| "missing SOP Class UID".to_string())?;
+    .context(MissingSopClassUidSnafu)?;
   let sop_instance = obj
     .element(dicom_dictionary_std::tags::SOP_INSTANCE_UID)
     .ok()
     .and_then(|e| e.to_str().ok())
     .map(|s| s.trim_end_matches(['\0', ' ']).to_string())
-    .ok_or_else(|| "missing SOP Instance UID".to_string())?;
+    .context(MissingSopInstanceUidSnafu)?;
   let file_meta = FileMetaTableBuilder::new()
     .media_storage_sop_class_uid(&sop_class)
     .media_storage_sop_instance_uid(&sop_instance)
     .transfer_syntax(ts_uid)
     .build()
-    .map_err(|e| format!("failed to build file meta: {e}"))?;
+    .map_err(|e| ScpError::BuildFileMeta {
+      reason: e.to_string(),
+    })?;
   let file_obj = obj.with_exact_meta(file_meta);
 
   let calling_ae = association.peer_ae_title();
   let destinations = cfg.destinations_for_source(calling_ae);
   if destinations.is_empty() {
-    return Err(format!("no destination configured for calling AE {calling_ae:?}"));
+    return NoDestinationSnafu { calling_ae: calling_ae.to_string() }.fail();
   }
   let dirs: Vec<std::path::PathBuf> = destinations.iter().map(|dest| cfg.queue_dir_for(&dest.name)).collect();
   let dest_count = destinations.len();
@@ -305,8 +351,11 @@ where
     queue::enqueue_fanout(&dir_refs, &file_obj, min_free_bytes)
   })
   .await
-  .map_err(|e| format!("spool task panicked: {e}"))?
-  .map_err(|e| format!("spool failed for {dest_count} destination(s): {e}"))?;
+  .context(SpoolTaskPanickedSnafu)?
+  .map_err(|source| ScpError::Spool {
+    destination_count: dest_count,
+    source,
+  })?;
   info!(
       log,
       "object spooled";
