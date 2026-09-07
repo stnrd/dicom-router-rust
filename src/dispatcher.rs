@@ -115,15 +115,33 @@ pub fn spawn(
         let slog = log.clone();
         sends.spawn(async move {
           let _permit = permit;
+          if spooled.delivered {
+            if let Err(e) = queue::acknowledge(&spooled) {
+              error!(
+                  slog,
+                  "delivered but failed to delete spool file";
+                  "error" => %e
+              );
+            }
+            return;
+          }
           match scu::forward(&dest, tls, &spooled, &ae, max_pdu_length, &slog).await {
-            Ok(()) =>
+            Ok(()) => {
+              if let Err(e) = queue::mark_delivered(&spooled) {
+                error!(
+                    slog,
+                    "forwarded but failed to mark delivered";
+                    "error" => %e
+                );
+              }
               if let Err(e) = queue::acknowledge(&spooled) {
                 error!(
                     slog,
                     "forwarded but failed to delete spool file";
                     "error" => %e
                 );
-              },
+              }
+            }
             Err(e) => {
               warn!(
                   slog,

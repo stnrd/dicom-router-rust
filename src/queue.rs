@@ -11,6 +11,8 @@ use snafu::Snafu;
 pub struct Sidecar {
   pub attempts:   u32,
   pub last_error: Option<String>,
+  #[serde(default)]
+  pub delivered:  bool,
 }
 
 #[derive(Debug, Clone)]
@@ -19,6 +21,7 @@ pub struct SpooledObject {
   pub sidecar_path: PathBuf,
   pub attempts:     u32,
   pub last_error:   Option<String>,
+  pub delivered:    bool,
 }
 
 #[derive(Debug, Snafu)]
@@ -180,6 +183,7 @@ pub fn scan(dir: &Path) -> Result<Vec<SpooledObject>> {
       sidecar_path,
       attempts: sidecar.attempts,
       last_error: sidecar.last_error,
+      delivered: sidecar.delivered,
     });
   }
   out.sort_by(|a, b| a.dcm_path.cmp(&b.dcm_path));
@@ -191,6 +195,22 @@ pub fn record_failure(obj: &SpooledObject, error: &str) -> Result<()> {
   let sidecar = Sidecar {
     attempts:   obj.attempts + 1,
     last_error: Some(error.chars().take(500).collect()),
+    delivered:  false,
+  };
+  let yaml = serde_yaml::to_string(&sidecar).map_err(|e| QueueError::Sidecar { source: e })?;
+  let part = obj.sidecar_path.with_extension("yaml.part");
+  std::fs::write(&part, yaml).map_err(io(&part))?;
+  fsync_file(&part)?;
+  std::fs::rename(&part, &obj.sidecar_path).map_err(io(&obj.sidecar_path))
+}
+
+/// Mark an object as successfully forwarded so a failed `acknowledge` does not
+/// trigger a duplicate C-STORE on retry.
+pub fn mark_delivered(obj: &SpooledObject) -> Result<()> {
+  let sidecar = Sidecar {
+    attempts:   obj.attempts,
+    last_error: obj.last_error.clone(),
+    delivered:  true,
   };
   let yaml = serde_yaml::to_string(&sidecar).map_err(|e| QueueError::Sidecar { source: e })?;
   let part = obj.sidecar_path.with_extension("yaml.part");
@@ -326,6 +346,19 @@ mod tests {
     assert_eq!(paths.len(), 2);
     assert_eq!(scan(&dir_a).unwrap().len(), 1);
     assert_eq!(scan(&dir_b).unwrap().len(), 1);
+  }
+
+  #[test]
+  fn mark_delivered_persists_without_removing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    enqueue(dir.path(), &test_object("10.10.10"), 0).unwrap();
+    let pending = scan(dir.path()).unwrap();
+    assert!(!pending[0].delivered);
+    mark_delivered(&pending[0]).unwrap();
+    let pending = scan(dir.path()).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].delivered);
+    assert!(pending[0].dcm_path.exists());
   }
 
   #[test]
