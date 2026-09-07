@@ -47,7 +47,11 @@ A future `docker-tests` feature could start external destinations (e.g. Orthanc)
 
 ## CI
 
-GitLab CI runs `task lint` on merge requests and tagged releases. Image publishing uses Kaniko on version tags (see [`.gitlab-ci.yml`](.gitlab-ci.yml)).
+GitHub Actions runs `task lint` and `task test` on pull requests and pushes to all branches.
+
+Version tags (`v1.2.3`, `v1.2.3-rc1`) publish a Docker image to [GHCR](https://github.com/features/packages) (`ghcr.io/<owner>/dicom-router-rust`).
+
+See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
 ## Operations
 
