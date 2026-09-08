@@ -2,10 +2,15 @@
 //! rename) and retry sidecars.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use dicom_object::{FileDicomObject, InMemDicomObject};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
+
+/// Default age threshold for [`cleanup_stale`]: files older than this with no
+/// matching sidecar (or any `.part` suffix) are treated as crash debris.
+pub const DEFAULT_STALE_MAX_AGE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Sidecar {
@@ -22,6 +27,12 @@ pub struct SpooledObject {
   pub attempts:     u32,
   pub last_error:   Option<String>,
   pub delivered:    bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupStats {
+  pub part_files_removed: u32,
+  pub orphan_dcm_removed: u32,
 }
 
 #[derive(Debug, Snafu)]
@@ -154,7 +165,11 @@ fn fsync_dir(path: &Path) -> Result<()> {
     .map_err(io(path))
 }
 
-/// List committed objects. Cleans up `.part` files and orphan `.dcm` files.
+/// List committed objects ready for forwarding (`.dcm` + matching `.yaml`).
+///
+/// This function is read-only: it never deletes files. In-progress enqueues
+/// (`.part` files, `.dcm` without a sidecar yet) are skipped so concurrent
+/// dispatcher scans cannot race with [`enqueue`].
 pub fn scan(dir: &Path) -> Result<Vec<SpooledObject>> {
   let mut out = Vec::new();
   if !dir.exists() {
@@ -164,16 +179,11 @@ pub fn scan(dir: &Path) -> Result<Vec<SpooledObject>> {
     let entry = entry.map_err(io(dir))?;
     let path = entry.path();
     let name = entry.file_name().to_string_lossy().to_string();
-    if name.ends_with(".part") {
-      let _ = std::fs::remove_file(&path);
-      continue;
-    }
-    if !name.ends_with(".dcm") {
+    if name.ends_with(".part") || !name.ends_with(".dcm") {
       continue;
     }
     let sidecar_path = path.with_extension("yaml");
     if !sidecar_path.exists() {
-      let _ = std::fs::remove_file(&path);
       continue;
     }
     let text = std::fs::read_to_string(&sidecar_path).map_err(io(&sidecar_path))?;
@@ -188,6 +198,45 @@ pub fn scan(dir: &Path) -> Result<Vec<SpooledObject>> {
   }
   out.sort_by(|a, b| a.dcm_path.cmp(&b.dcm_path));
   Ok(out)
+}
+
+/// Remove abandoned `.part` files and orphan `.dcm` files older than `max_age`.
+///
+/// Call at router startup (and optionally on a slow timer) — not from the hot
+/// dispatcher scan loop, which would race with in-flight [`enqueue`] writes.
+pub fn cleanup_stale(dir: &Path, max_age: Duration) -> Result<CleanupStats> {
+  let mut stats = CleanupStats::default();
+  if !dir.exists() {
+    return Ok(stats);
+  }
+  for entry in std::fs::read_dir(dir).map_err(io(dir))? {
+    let entry = entry.map_err(io(dir))?;
+    let path = entry.path();
+    let name = entry.file_name().to_string_lossy().to_string();
+    if name.ends_with(".part") {
+      if is_older_than(&path, max_age)? {
+        let _ = std::fs::remove_file(&path);
+        stats.part_files_removed += 1;
+      }
+      continue;
+    }
+    if name.ends_with(".dcm") {
+      let sidecar_path = path.with_extension("yaml");
+      if !sidecar_path.exists() && is_older_than(&path, max_age)? {
+        let _ = std::fs::remove_file(&path);
+        stats.orphan_dcm_removed += 1;
+      }
+    }
+  }
+  Ok(stats)
+}
+
+fn is_older_than(path: &Path, max_age: Duration) -> Result<bool> {
+  let mtime = std::fs::metadata(path).map_err(io(path))?.modified().map_err(io(path))?;
+  let cutoff = SystemTime::now()
+    .checked_sub(max_age)
+    .unwrap_or(SystemTime::UNIX_EPOCH);
+  Ok(mtime < cutoff)
 }
 
 /// Persist a failed attempt (increments counter, records error).
@@ -237,11 +286,22 @@ pub fn move_to_dead_letter(obj: &SpooledObject, dead_letter_dir: &Path) -> Resul
 
 #[cfg(test)]
 mod tests {
+  use std::time::Duration;
+
   use dicom_core::{dicom_value, DataElement, VR};
   use dicom_dictionary_std::{tags, uids};
   use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 
   use super::*;
+
+  fn set_mtime_old(path: &std::path::Path) {
+    let file = std::fs::OpenOptions::new()
+      .write(true)
+      .open(path)
+      .unwrap();
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    file.set_modified(old).unwrap();
+  }
 
   fn test_object(sop_instance_uid: &str) -> dicom_object::FileDicomObject<InMemDicomObject> {
     let mut obj = InMemDicomObject::new_empty();
@@ -283,12 +343,76 @@ mod tests {
   #[test]
   fn stray_part_and_orphan_dcm_are_cleaned() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("2.2.2.part"), b"junk").unwrap();
-    std::fs::write(dir.path().join("3.3.3.dcm"), b"orphan").unwrap();
-    let pending = scan(dir.path()).unwrap();
-    assert!(pending.is_empty());
-    assert!(!dir.path().join("2.2.2.part").exists());
-    assert!(!dir.path().join("3.3.3.dcm").exists());
+    let part = dir.path().join("2.2.2.part");
+    let orphan = dir.path().join("3.3.3.dcm");
+    std::fs::write(&part, b"junk").unwrap();
+    std::fs::write(&orphan, b"orphan").unwrap();
+    set_mtime_old(&part);
+    set_mtime_old(&orphan);
+
+    assert!(scan(dir.path()).unwrap().is_empty());
+    assert!(part.exists());
+    assert!(orphan.exists());
+
+    let stats = cleanup_stale(dir.path(), Duration::from_secs(1)).unwrap();
+    assert_eq!(stats.part_files_removed, 1);
+    assert_eq!(stats.orphan_dcm_removed, 1);
+    assert!(!part.exists());
+    assert!(!orphan.exists());
+  }
+
+  #[test]
+  fn scan_does_not_delete_part_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("inflight.dcm.part");
+    std::fs::write(&part, b"writing").unwrap();
+    set_mtime_old(&part);
+
+    assert!(scan(dir.path()).unwrap().is_empty());
+    assert!(part.exists());
+  }
+
+  #[test]
+  fn scan_does_not_delete_dcm_without_yaml() {
+    let dir = tempfile::tempdir().unwrap();
+    let dcm = dir.path().join("inflight.dcm");
+    std::fs::write(&dcm, b"partial").unwrap();
+    set_mtime_old(&dcm);
+
+    assert!(scan(dir.path()).unwrap().is_empty());
+    assert!(dcm.exists());
+  }
+
+  #[test]
+  fn cleanup_stale_keeps_young_part_and_orphan_dcm() {
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("fresh.part");
+    let orphan = dir.path().join("fresh.dcm");
+    std::fs::write(&part, b"new").unwrap();
+    std::fs::write(&orphan, b"new").unwrap();
+
+    let stats = cleanup_stale(dir.path(), Duration::from_secs(3600)).unwrap();
+    assert_eq!(stats, CleanupStats::default());
+    assert!(part.exists());
+    assert!(orphan.exists());
+  }
+
+  #[test]
+  fn scan_does_not_interfere_with_enqueue() {
+    let dir = tempfile::tempdir().unwrap();
+    let scan_dir = dir.path().to_path_buf();
+    let scanner = std::thread::spawn(move || {
+      for _ in 0..500 {
+        let _ = scan(&scan_dir);
+      }
+    });
+
+    for i in 0..20 {
+      enqueue(dir.path(), &test_object(&format!("race.{i}")), 0).unwrap();
+    }
+    scanner.join().unwrap();
+
+    assert_eq!(scan(dir.path()).unwrap().len(), 20);
   }
 
   #[test]

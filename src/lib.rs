@@ -13,7 +13,7 @@ pub mod tls;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use slog::{error, info};
+use slog::{error, info, warn};
 use tokio_util::sync::CancellationToken;
 
 pub fn run(config_path: PathBuf, check_only: bool) -> i32 {
@@ -67,6 +67,30 @@ async fn async_main(cfg: config::Config, log: slog::Logger) -> i32 {
   if let Err(e) = std::fs::create_dir_all(&cfg.dead_letter_dir) {
     error!(log, "cannot create dead-letter dir"; "error" => %e);
     return 2;
+  }
+
+  for dest in &cfg.destinations {
+    let qdir = cfg.queue_dir_for(&dest.name);
+    match queue::cleanup_stale(&qdir, queue::DEFAULT_STALE_MAX_AGE) {
+      Ok(stats) if stats.part_files_removed > 0 || stats.orphan_dcm_removed > 0 => {
+        info!(
+            log,
+            "removed stale queue debris at startup";
+            "destination" => &dest.name,
+            "part_files_removed" => stats.part_files_removed,
+            "orphan_dcm_removed" => stats.orphan_dcm_removed
+        );
+      }
+      Ok(_) => {}
+      Err(e) => {
+        warn!(
+            log,
+            "queue cleanup failed at startup";
+            "destination" => &dest.name,
+            "error" => %e
+        );
+      }
+    }
   }
 
   let scp_handle = match scp::spawn(cfg.clone(), server_tls, log.clone(), shutdown.clone()).await {
