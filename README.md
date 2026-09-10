@@ -1,0 +1,66 @@
+# DICOM Router (Rust)
+
+Production-grade, TLS-only DICOM C-STORE router. Receives DICOM over TLS, durably spools to disk, and forwards to one or more destinations over verified TLS.
+
+## Architecture
+
+```
+Modality (TLS) → Router SCP → spool queue → Dispatcher → Router SCU (TLS) → PACS
+```
+
+- **Inbound:** TLS SCP (port 2762 by default). Optional inbound mTLS via `tls.client_ca`.
+- **Outbound:** Always TLS with CA verification. Optional client cert per destination.
+- **Durability:** C-STORE-RSP success is sent only after atomic spool to disk.
+- **Routing:** Fan-out to all destinations; optional `source_ae_titles` filter per destination.
+- **Atomic fan-out:** C-STORE-RSP success is sent only after the object is durably spooled to *all* matching destination queues; a failure on any destination rolls back the others.
+
+## Configuration
+
+YAML config (Kubernetes ConfigMap friendly). See [`config.example.yaml`](config.example.yaml).
+
+Configuration is validated on every startup (`Config::load` → `validate()`). Invalid YAML or rule violations print `configuration error: …` and exit code 2 before the router binds or loads TLS.
+
+```bash
+dicom-router --config /path/to/config.yaml
+```
+
+## Logging
+
+JSON lines to stdout, Go `slog`-style fields: `msg`, `level` (`WARN`, `ERROR`, …), `ts` (RFC3339 UTC), plus key-values.
+
+## Local development
+
+```bash
+./scripts/gen-dev-certs.sh dev-certs
+# edit config to point at dev-certs/*.crt and *.key
+cargo run -- --config config.example.yaml
+```
+
+## Tests
+
+```bash
+task test
+# or: cargo test
+```
+
+Integration coverage is in-process: `tests/loopback.rs` runs the router (SCP + dispatcher + SCU) in the test process and uses an in-process TLS destination SCP as a stand-in for a PACS.
+
+A future `docker-tests` feature could start external destinations (e.g. Orthanc) via testcontainers; stock Orthanc speaks cleartext DICOM by default while this router always forwards over TLS, so that needs extra certificate wiring first.
+
+## CI
+
+GitHub Actions runs `task lint` and `task test` on pull requests and pushes to all branches.
+
+Version tags (`v1.2.3`, `v1.2.3-rc1`) publish a Docker image to [GHCR](https://github.com/features/packages) (`ghcr.io/<owner>/dicom-router-rust`).
+
+See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+## Operations
+
+- **Queue depth:** count files in `<queue_dir>/<destination>/`.
+- **Dead letters:** objects in `dead_letter_dir` after `retry.max_attempts` exhausted.
+- **Reprocess:** move `.dcm` + `.yaml` from dead-letter back into the destination queue dir.
+
+## License
+
+Internal / project-specific.

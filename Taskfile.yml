@@ -1,0 +1,57 @@
+# https://taskfile.dev/#/
+---
+version: "3"
+
+vars:
+  CARGO: cargo
+
+tasks:
+  default:
+    cmds:
+      - task -l
+
+  ### Build
+
+  build:
+    desc: "Build debug binary."
+    cmds:
+      - "{{.CARGO}} build"
+
+  build:release:
+    desc: "Build release binary."
+    cmds:
+      - "{{.CARGO}} build --release"
+
+  ### Format / Lint
+
+  fmt:
+    desc: "Format sources (requires nightly toolchain)."
+    cmds:
+      - "{{.CARGO}} +nightly fmt --all"
+
+  clippy:
+    desc: "Run clippy (deny warnings)."
+    cmds:
+      - "{{.CARGO}} +nightly clippy --all-targets -- -D warnings"
+
+  lint:
+    desc: "Run all linters."
+    cmds:
+      - task: fmt
+      - task: clippy
+
+  ### Test
+
+  test:
+    desc: "Run unit and integration tests."
+    cmds:
+      - "{{.CARGO}} test {{.CLI_ARGS}}"
+
+  ### All
+
+  all:
+    desc: "Run format, lint, and regular tests."
+    cmds:
+      - task: fmt
+      - task: clippy
+      - task: test

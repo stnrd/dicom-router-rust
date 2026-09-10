@@ -1,0 +1,37 @@
+# dicom-router configuration (mount as a Kubernetes ConfigMap)
+listen_addr: "0.0.0.0:2762"
+ae_title: "RUST_ROUTER"
+max_pdu_length: 131072
+queue_dir: "/var/lib/dicom-router/queue"
+dead_letter_dir: "/var/lib/dicom-router/dead-letter"
+max_concurrent_associations: 32
+max_concurrent_sends: 4
+promiscuous: false
+log_level: "info"
+min_free_bytes: 536870912
+
+retry:
+  initial_delay_ms: 1000
+  max_delay_ms: 60000
+  multiplier: 2.0
+  max_attempts: 10
+
+tls:
+  server_cert: "/etc/dicom-router/tls/server.crt"
+  server_key: "/etc/dicom-router/tls/server.key"
+  # client_ca: "/etc/dicom-router/tls/ca.crt"  # enable inbound mTLS
+
+destinations:
+  - name: pacs-main
+    ae_title: "PACS_MAIN"
+    host: "pacs.dicom.svc.cluster.local"
+    port: 2762
+    server_name: "pacs.example.org"
+    ca_cert: "/etc/dicom-router/tls/pacs-ca.crt"
+
+  - name: pacs-backup
+    ae_title: "PACS_BACKUP"
+    host: "pacs-backup.dicom.svc.cluster.local"
+    port: 2762
+    ca_cert: "/etc/dicom-router/tls/pacs-ca.crt"
+    # source_ae_titles: ["CT_SCANNER_1"]  # optional filter by calling AE
