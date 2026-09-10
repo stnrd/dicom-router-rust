@@ -4,6 +4,7 @@ pub mod config;
 pub mod dimse;
 pub mod dispatcher;
 pub mod logging;
+pub mod outbound_session;
 pub mod queue;
 pub mod retry;
 pub mod scp;

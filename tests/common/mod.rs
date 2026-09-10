@@ -42,9 +42,10 @@ pub fn test_object(sop_instance_uid: &str) -> dicom_object::FileDicomObject<InMe
 
 /// In-process TLS C-STORE SCP that records received SOP Instance UIDs.
 pub struct TestScp {
-  pub port:     u16,
-  pub received: Arc<Mutex<Vec<String>>>,
-  _handle:      tokio::task::JoinHandle<()>,
+  pub port:              u16,
+  pub received:          Arc<Mutex<Vec<String>>>,
+  pub association_count: Arc<std::sync::atomic::AtomicU32>,
+  _handle:               tokio::task::JoinHandle<()>,
 }
 
 pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
@@ -59,12 +60,15 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
   let port = listener.local_addr().unwrap().port();
   let received = Arc::new(Mutex::new(Vec::new()));
   let received2 = received.clone();
+  let association_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+  let association_count2 = association_count.clone();
 
   let handle = tokio::spawn(async move {
     loop {
       let (stream, _) = listener.accept().await.expect("accept");
       let tls_cfg = tls_cfg.clone();
       let received = received2.clone();
+      let association_count = association_count2.clone();
       tokio::spawn(async move {
         let options = ServerAssociationOptions::new()
           .accept_any()
@@ -72,6 +76,7 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
           .promiscuous(true)
           .tls_config(tls_cfg);
         let mut assoc = options.establish_tls_async(stream).await.expect("assoc");
+        association_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut buf: Vec<u8> = Vec::new();
         let mut msgid = 1u16;
         let mut class = String::new();
@@ -127,6 +132,7 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
   TestScp {
     port,
     received,
+    association_count,
     _handle: handle,
   }
 }
