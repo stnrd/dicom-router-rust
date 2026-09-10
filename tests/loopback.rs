@@ -54,16 +54,16 @@ destinations:
     .unwrap();
   let client_tls = tls::build_client_config(&pki.ca, None, None).unwrap();
   let _disp = dispatcher::spawn(dispatcher::WorkerConfig {
-    destination: cfg.destinations[0].clone(),
-    client_tls: client_tls.clone(),
-    queue_root: cfg.queue_dir.clone(),
-    dead_letter_dir: cfg.dead_letter_dir.clone(),
-    retry_cfg: cfg.retry.clone(),
-    calling_ae_title: cfg.ae_title.clone(),
-    max_pdu_length: cfg.max_pdu_length,
+    destination:          cfg.destinations[0].clone(),
+    client_tls:           client_tls.clone(),
+    queue_root:           cfg.queue_dir.clone(),
+    dead_letter_dir:      cfg.dead_letter_dir.clone(),
+    retry_cfg:            cfg.retry.clone(),
+    calling_ae_title:     cfg.ae_title.clone(),
+    max_pdu_length:       cfg.max_pdu_length,
     max_concurrent_sends: cfg.max_concurrent_sends,
-    log: log.clone(),
-    shutdown: token.clone(),
+    log:                  log.clone(),
+    shutdown:             token.clone(),
   });
 
   let mut assoc = ClientAssociationOptions::new()

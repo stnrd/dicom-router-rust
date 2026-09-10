@@ -18,7 +18,7 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// Configuration for one per-destination dispatcher worker.
 pub struct WorkerConfig {
   pub destination:          Destination,
-  pub client_tls:         Arc<rustls::ClientConfig>,
+  pub client_tls:           Arc<rustls::ClientConfig>,
   pub queue_root:           PathBuf,
   pub dead_letter_dir:      PathBuf,
   pub retry_cfg:            RetryConfig,

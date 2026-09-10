@@ -168,11 +168,7 @@ pub async fn spawn(
   Ok(handle)
 }
 
-async fn handle_association<S>(
-  mut association: AsyncServerAssociation<S>,
-  cfg: &Config,
-  log: Logger,
-) -> Result<()>
+async fn handle_association<S>(mut association: AsyncServerAssociation<S>, cfg: &Config, log: Logger) -> Result<()>
 where
   S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -266,11 +262,7 @@ where
   Ok(())
 }
 
-async fn send_command<S>(
-  association: &mut AsyncServerAssociation<S>,
-  cmd: &CommandSet,
-  pc_id: u8,
-) -> Result<()>
+async fn send_command<S>(association: &mut AsyncServerAssociation<S>, cmd: &CommandSet, pc_id: u8) -> Result<()>
 where
   S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -309,13 +301,10 @@ where
   let ts_uid = &pc.transfer_syntax;
   let ts = TransferSyntaxRegistry
     .get(ts_uid)
-    .context(UnsupportedTransferSyntaxSnafu {
-      ts_uid: ts_uid.clone(),
-    })?;
+    .context(UnsupportedTransferSyntaxSnafu { ts_uid: ts_uid.clone() })?;
 
-  let obj = InMemDicomObject::read_dataset_with_ts(dataset, ts).map_err(|e| ScpError::ReadDataset {
-    source: Box::new(e),
-  })?;
+  let obj =
+    InMemDicomObject::read_dataset_with_ts(dataset, ts).map_err(|e| ScpError::ReadDataset { source: Box::new(e) })?;
   let sop_class = obj
     .element(dicom_dictionary_std::tags::SOP_CLASS_UID)
     .ok()
@@ -333,15 +322,16 @@ where
     .media_storage_sop_instance_uid(&sop_instance)
     .transfer_syntax(ts_uid)
     .build()
-    .map_err(|e| ScpError::BuildFileMeta {
-      reason: e.to_string(),
-    })?;
+    .map_err(|e| ScpError::BuildFileMeta { reason: e.to_string() })?;
   let file_obj = obj.with_exact_meta(file_meta);
 
   let calling_ae = association.peer_ae_title();
   let destinations = cfg.destinations_for_source(calling_ae);
   if destinations.is_empty() {
-    return NoDestinationSnafu { calling_ae: calling_ae.to_string() }.fail();
+    return NoDestinationSnafu {
+      calling_ae: calling_ae.to_string(),
+    }
+    .fail();
   }
   let dirs: Vec<std::path::PathBuf> = destinations.iter().map(|dest| cfg.queue_dir_for(&dest.name)).collect();
   let dest_count = destinations.len();

@@ -232,10 +232,11 @@ pub fn cleanup_stale(dir: &Path, max_age: Duration) -> Result<CleanupStats> {
 }
 
 fn is_older_than(path: &Path, max_age: Duration) -> Result<bool> {
-  let mtime = std::fs::metadata(path).map_err(io(path))?.modified().map_err(io(path))?;
-  let cutoff = SystemTime::now()
-    .checked_sub(max_age)
-    .unwrap_or(SystemTime::UNIX_EPOCH);
+  let mtime = std::fs::metadata(path)
+    .map_err(io(path))?
+    .modified()
+    .map_err(io(path))?;
+  let cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
   Ok(mtime < cutoff)
 }
 
@@ -295,10 +296,7 @@ mod tests {
   use super::*;
 
   fn set_mtime_old(path: &std::path::Path) {
-    let file = std::fs::OpenOptions::new()
-      .write(true)
-      .open(path)
-      .unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
     let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
     file.set_modified(old).unwrap();
   }
