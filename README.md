@@ -18,8 +18,10 @@ Modality (TLS) → Router SCP → spool queue → Dispatcher → Router SCU (TLS
 
 YAML config (Kubernetes ConfigMap friendly). See [`config.example.yaml`](config.example.yaml).
 
+Configuration is validated on every startup (`Config::load` → `validate()`). Invalid YAML or rule violations print `configuration error: …` and exit code 2 before the router binds or loads TLS.
+
 ```bash
-dicom-router --config /path/to/config.yaml --check
+dicom-router --config /path/to/config.yaml
 ```
 
 ## Logging

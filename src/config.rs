@@ -163,6 +163,24 @@ impl Config {
     if self.max_pdu_length < 1_018 {
       return Err(invalid("max_pdu_length must be >= 1018".into()));
     }
+    if self.max_concurrent_associations == 0 {
+      return Err(invalid("max_concurrent_associations must be >= 1".into()));
+    }
+    if self.max_concurrent_sends == 0 {
+      return Err(invalid("max_concurrent_sends must be >= 1".into()));
+    }
+    if self.retry.max_attempts == 0 {
+      return Err(invalid("retry.max_attempts must be >= 1".into()));
+    }
+    if self.retry.multiplier <= 0.0 {
+      return Err(invalid("retry.multiplier must be > 0".into()));
+    }
+    if self.retry.initial_delay_ms == 0 {
+      return Err(invalid("retry.initial_delay_ms must be >= 1".into()));
+    }
+    if self.retry.max_delay_ms < self.retry.initial_delay_ms {
+      return Err(invalid("retry.max_delay_ms must be >= retry.initial_delay_ms".into()));
+    }
     if crate::logging::parse_level(&self.log_level).is_none() {
       return Err(invalid(format!("invalid log_level {:?}", self.log_level)));
     }
@@ -252,6 +270,85 @@ destinations: []
     let yaml = VALID_YAML.replace("listen_addr:", "log_level: \"warining\"\nlisten_addr:");
     let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
     assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn rejects_dest_ae_title_too_long() {
+    let yaml = VALID_YAML.replace("ae_title: \"PACS_MAIN\"", "ae_title: \"THIS_IS_WAY_TOO_LONG\"");
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn rejects_client_cert_without_key() {
+    let yaml = VALID_YAML.replace(
+      "    ca_cert: \"tests/certs/ca.crt\"\n  - name: pacs-backup",
+      "    ca_cert: \"tests/certs/ca.crt\"\n    client_cert: \"tests/certs/client.crt\"\n  - name: pacs-backup",
+    );
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn rejects_max_pdu_below_minimum() {
+    let yaml = VALID_YAML.replace("listen_addr:", "max_pdu_length: 1017\nlisten_addr:");
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn accepts_max_pdu_at_minimum() {
+    let yaml = VALID_YAML.replace("listen_addr:", "max_pdu_length: 1018\nlisten_addr:");
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_ok());
+  }
+
+  #[test]
+  fn rejects_zero_max_concurrent_associations() {
+    let yaml = VALID_YAML.replace("listen_addr:", "max_concurrent_associations: 0\nlisten_addr:");
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn rejects_zero_max_concurrent_sends() {
+    let yaml = VALID_YAML.replace("listen_addr:", "max_concurrent_sends: 0\nlisten_addr:");
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn rejects_zero_retry_attempts() {
+    let yaml = VALID_YAML.replace("listen_addr:", "retry:\n  max_attempts: 0\nlisten_addr:");
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn rejects_non_positive_retry_multiplier() {
+    let yaml = VALID_YAML.replace("listen_addr:", "retry:\n  multiplier: 0\nlisten_addr:");
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn rejects_retry_max_delay_below_initial() {
+    let yaml = VALID_YAML.replace(
+      "listen_addr:",
+      "retry:\n  initial_delay_ms: 5000\n  max_delay_ms: 1000\nlisten_addr:",
+    );
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn load_rejects_malformed_yaml() {
+    let dir = std::env::temp_dir().join("dicom-router-config-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bad.yaml");
+    std::fs::write(&path, "listen_addr: [\n").unwrap();
+    let err = Config::load(&path).unwrap_err();
+    assert!(err.to_string().contains("invalid YAML"));
   }
 
   #[test]

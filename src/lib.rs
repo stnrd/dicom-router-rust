@@ -16,7 +16,7 @@ use std::sync::Arc;
 use slog::{error, info, warn};
 use tokio_util::sync::CancellationToken;
 
-pub fn run(config_path: PathBuf, check_only: bool) -> i32 {
+pub fn run(config_path: PathBuf) -> i32 {
   let cfg = match config::Config::load(&config_path) {
     Ok(c) => c,
     Err(e) => {
@@ -24,10 +24,6 @@ pub fn run(config_path: PathBuf, check_only: bool) -> i32 {
       return 2;
     }
   };
-  if check_only {
-    println!("configuration OK ({} destinations)", cfg.destinations.len());
-    return 0;
-  }
 
   let (log, _guard) = logging::init_logger(logging::parse_level(&cfg.log_level).unwrap_or(slog::Level::Info));
   let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
