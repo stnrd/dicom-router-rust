@@ -25,6 +25,13 @@ pub struct PresentationKey {
 }
 
 #[derive(Debug, Clone)]
+pub struct RoleSelection {
+  pub sop_class: String,
+  pub scu:       bool,
+  pub scp:       bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct SpooledMeta {
   pub sop_class_uid:    String,
   pub sop_instance_uid: String,
@@ -97,6 +104,25 @@ pub async fn connect(
   max_pdu_length: u32,
   pcs: &[PresentationKey],
 ) -> Result<AsyncClientAssociation<AsyncTlsStream>, ScuError> {
+  connect_with_roles(
+    destination,
+    client_tls,
+    calling_ae_title,
+    max_pdu_length,
+    pcs,
+    &[],
+  )
+  .await
+}
+
+pub async fn connect_with_roles(
+  destination: &Destination,
+  client_tls: Arc<rustls::ClientConfig>,
+  calling_ae_title: &str,
+  max_pdu_length: u32,
+  pcs: &[PresentationKey],
+  roles: &[RoleSelection],
+) -> Result<AsyncClientAssociation<AsyncTlsStream>, ScuError> {
   let ae_address = format!("{}@{}:{}", destination.ae_title, destination.host, destination.port);
   let server_name = destination
     .server_name
@@ -112,6 +138,9 @@ pub async fn connect(
 
   for pc in pcs {
     options = options.with_presentation_context(pc.abstract_syntax.clone(), vec![pc.transfer_syntax.clone()]);
+  }
+  for role in roles {
+    options = options.with_role_selection(role.sop_class.clone(), role.scu, role.scp);
   }
 
   options
@@ -305,6 +334,17 @@ pub fn merge_presentation_keys(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn role_selection_storage_scp_for_get() {
+    let role = RoleSelection {
+      sop_class: dicom_dictionary_std::uids::CT_IMAGE_STORAGE.to_string(),
+      scu:       false,
+      scp:       true,
+    };
+    assert!(!role.scu);
+    assert!(role.scp);
+  }
 
   #[test]
   fn merge_presentation_keys_adds_new_meta() {
