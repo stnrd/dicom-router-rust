@@ -5,6 +5,7 @@ pub mod dimse;
 pub mod dispatcher;
 pub mod logging;
 pub mod outbound_session;
+pub mod qr;
 pub mod queue;
 pub mod retry;
 pub mod scp;
@@ -90,7 +91,27 @@ async fn async_main(cfg: config::Config, log: slog::Logger) -> i32 {
     }
   }
 
-  let scp_handle = match scp::spawn(cfg.clone(), server_tls, log.clone(), shutdown.clone()).await {
+  let qr = match cfg.qr_destination() {
+    Some(dest) => match tls::build_client_config(&dest.ca_cert, dest.client_cert.as_deref(), dest.client_key.as_deref())
+    {
+      Ok(client_tls) => Some(qr::QrClient {
+        destination: dest.clone(),
+        client_tls,
+      }),
+      Err(e) => {
+        error!(
+            log,
+            "failed to build QR client TLS config";
+            "destination" => &dest.name,
+            "error" => %e
+        );
+        return 2;
+      }
+    },
+    None => None,
+  };
+
+  let scp_handle = match scp::spawn(cfg.clone(), server_tls, log.clone(), shutdown.clone(), qr).await {
     Ok(h) => h,
     Err(e) => {
       error!(

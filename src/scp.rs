@@ -18,7 +18,22 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::dimse::{self, CommandSet, TAG_AFFECTED_SOP_CLASS_UID, TAG_AFFECTED_SOP_INSTANCE_UID, TAG_MESSAGE_ID};
+use crate::qr::{self, QrClient};
 use crate::queue::{self, QueueError};
+
+enum Pending {
+  None,
+  Store {
+    msgid:             u16,
+    sop_class_uid:     String,
+    sop_instance_uid:  String,
+  },
+  Find {
+    msgid:         u16,
+    sop_class_uid: String,
+    pc_id:         u8,
+  },
+}
 
 #[derive(Debug, Snafu)]
 pub enum ScpError {
@@ -74,6 +89,7 @@ pub const ABSTRACT_SYNTAXES: &[&str] = &[
 fn server_options(
   cfg: &Config,
   tls: Arc<rustls::ServerConfig>,
+  qr: Option<&QrClient>,
 ) -> ServerAssociationOptions<'static, AcceptAny, DefaultNegotiation> {
   let mut options = ServerAssociationOptions::new()
     .accept_any()
@@ -89,6 +105,11 @@ fn server_options(
   for uid in ABSTRACT_SYNTAXES {
     options = options.with_abstract_syntax(*uid);
   }
+  if qr.is_some() {
+    for uid in qr::QR_SOP_CLASSES {
+      options = options.with_abstract_syntax(*uid);
+    }
+  }
   options
 }
 
@@ -98,6 +119,7 @@ pub async fn spawn(
   tls: Arc<rustls::ServerConfig>,
   log: Logger,
   shutdown: CancellationToken,
+  qr: Option<QrClient>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
   let listener = TcpListener::bind(&cfg.listen_addr).await?;
   info!(
@@ -106,7 +128,7 @@ pub async fn spawn(
       "listen_addr" => &cfg.listen_addr,
       "ae_title" => &cfg.ae_title
   );
-  let options = server_options(&cfg, tls);
+  let options = server_options(&cfg, tls, qr.as_ref());
   let conn_sem = Arc::new(Semaphore::new(cfg.max_concurrent_associations));
 
   let handle = tokio::spawn(async move {
@@ -134,6 +156,7 @@ pub async fn spawn(
               let conn_log = log.new(o!("peer" => peer_str));
               let cfg = cfg.clone();
               let options = options.clone();
+              let qr = qr.clone();
               connections.spawn(async move {
                   let _permit = permit;
                   match options.establish_tls_async(stream).await {
@@ -149,7 +172,7 @@ pub async fn spawn(
                                   .filter(|pc| pc.reason == PresentationContextResultReason::Acceptance)
                                   .count() as u64
                           );
-                          if let Err(e) = handle_association(association, &cfg, alog.clone()).await {
+                          if let Err(e) = handle_association(association, &cfg, qr, alog.clone()).await {
                               warn!(alog, "association ended with error"; "error" => %e);
                           }
                           info!(alog, "association closed");
@@ -168,14 +191,17 @@ pub async fn spawn(
   Ok(handle)
 }
 
-async fn handle_association<S>(mut association: AsyncServerAssociation<S>, cfg: &Config, log: Logger) -> Result<()>
+async fn handle_association<S>(
+  mut association: AsyncServerAssociation<S>,
+  cfg: &Config,
+  qr: Option<QrClient>,
+  log: Logger,
+) -> Result<()>
 where
   S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-  let mut instance_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
-  let mut msgid: u16 = 1;
-  let mut sop_class_uid = String::new();
-  let mut sop_instance_uid = String::new();
+  let mut dataset_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
+  let mut pending = Pending::None;
 
   loop {
     let pdu = match association.receive().await {
@@ -191,7 +217,7 @@ where
       Pdu::PData { mut data } =>
         for data_value in &mut data {
           if data_value.value_type == PDataValueType::Data && !data_value.is_last {
-            instance_buffer.append(&mut data_value.data);
+            dataset_buffer.append(&mut data_value.data);
           } else if data_value.value_type == PDataValueType::Command && data_value.is_last {
             let obj = match dimse::decode_command(&data_value.data) {
               Ok(o) => o,
@@ -202,18 +228,29 @@ where
             };
             let command_field = dimse::command_field(&obj).unwrap_or(0);
             if command_field == dimse::C_ECHO_RQ {
-              msgid = dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0);
+              let msgid = dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0);
               let rsp = dimse::create_cecho_rsp(msgid, dimse::STATUS_SUCCESS);
               send_command(&mut association, &rsp, data_value.presentation_context_id).await?;
             } else if command_field == dimse::C_STORE_RQ {
-              msgid = dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0);
-              sop_class_uid = dimse::string(&obj, TAG_AFFECTED_SOP_CLASS_UID)
-                .unwrap_or("")
-                .to_string();
-              sop_instance_uid = dimse::string(&obj, TAG_AFFECTED_SOP_INSTANCE_UID)
-                .unwrap_or("")
-                .to_string();
-              instance_buffer.clear();
+              pending = Pending::Store {
+                msgid:            dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0),
+                sop_class_uid:    dimse::string(&obj, TAG_AFFECTED_SOP_CLASS_UID)
+                  .unwrap_or("")
+                  .to_string(),
+                sop_instance_uid: dimse::string(&obj, TAG_AFFECTED_SOP_INSTANCE_UID)
+                  .unwrap_or("")
+                  .to_string(),
+              };
+              dataset_buffer.clear();
+            } else if command_field == dimse::C_FIND_RQ {
+              pending = Pending::Find {
+                msgid:         dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0),
+                sop_class_uid: dimse::string(&obj, TAG_AFFECTED_SOP_CLASS_UID)
+                  .unwrap_or("")
+                  .to_string(),
+                pc_id:         data_value.presentation_context_id,
+              };
+              dataset_buffer.clear();
             } else {
               warn!(
                   log,
@@ -222,30 +259,70 @@ where
               );
             }
           } else if data_value.value_type == PDataValueType::Data && data_value.is_last {
-            instance_buffer.append(&mut data_value.data);
-            let status = match store_instance(
-              cfg,
-              &association,
-              data_value.presentation_context_id,
-              &instance_buffer,
-              &log,
-            )
-            .await
-            {
-              Ok(()) => dimse::STATUS_SUCCESS,
-              Err(e) => {
-                error!(
-                    log,
-                    "failed to spool object";
-                    "sop_instance_uid" => &sop_instance_uid,
-                    "error" => %e
-                );
-                dimse::STATUS_OUT_OF_RESOURCES
+            dataset_buffer.append(&mut data_value.data);
+            match std::mem::replace(&mut pending, Pending::None) {
+              Pending::Store {
+                msgid,
+                sop_class_uid,
+                sop_instance_uid,
+              } => {
+                let status = match store_instance(
+                  cfg,
+                  &association,
+                  data_value.presentation_context_id,
+                  &dataset_buffer,
+                  &log,
+                )
+                .await
+                {
+                  Ok(()) => dimse::STATUS_SUCCESS,
+                  Err(e) => {
+                    error!(
+                        log,
+                        "failed to spool object";
+                        "sop_instance_uid" => &sop_instance_uid,
+                        "error" => %e
+                    );
+                    dimse::STATUS_OUT_OF_RESOURCES
+                  }
+                };
+                dataset_buffer.clear();
+                let rsp = dimse::create_cstore_rsp(msgid, &sop_class_uid, &sop_instance_uid, status);
+                send_command(&mut association, &rsp, data_value.presentation_context_id).await?;
               }
-            };
-            instance_buffer.clear();
-            let rsp = dimse::create_cstore_rsp(msgid, &sop_class_uid, &sop_instance_uid, status);
-            send_command(&mut association, &rsp, data_value.presentation_context_id).await?;
+              Pending::Find {
+                msgid,
+                sop_class_uid,
+                pc_id,
+              } => {
+                let identifier = dataset_buffer.clone();
+                dataset_buffer.clear();
+                if let Some(qr_client) = qr.as_ref() {
+                  if let Err(e) = qr::proxy_find(
+                    &mut association,
+                    pc_id,
+                    msgid,
+                    &sop_class_uid,
+                    &identifier,
+                    qr_client,
+                    &cfg.ae_title,
+                    cfg.max_pdu_length,
+                    &log,
+                  )
+                  .await
+                  {
+                    warn!(log, "C-FIND proxy failed"; "error" => %e);
+                    let _ = qr::refuse_find(&mut association, pc_id, msgid, &sop_class_uid).await;
+                  }
+                } else {
+                  let _ = qr::refuse_find(&mut association, pc_id, msgid, &sop_class_uid).await;
+                }
+              }
+              Pending::None => {
+                dataset_buffer.clear();
+                warn!(log, "unexpected data PDU with no pending command");
+              }
+            }
           }
         },
       Pdu::ReleaseRQ => {
