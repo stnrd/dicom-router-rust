@@ -31,15 +31,15 @@ async fn stub_answers_cfind_with_one_pending_then_success() {
       data: vec![
         PDataValue {
           presentation_context_id: pc_id,
-          value_type: PDataValueType::Command,
-          is_last: true,
-          data: dimse::encode_command(&cmd),
+          value_type:              PDataValueType::Command,
+          is_last:                 true,
+          data:                    dimse::encode_command(&cmd),
         },
         PDataValue {
           presentation_context_id: pc_id,
-          value_type: PDataValueType::Data,
-          is_last: true,
-          data: ident,
+          value_type:              PDataValueType::Data,
+          is_last:                 true,
+          data:                    ident,
         },
       ],
     })

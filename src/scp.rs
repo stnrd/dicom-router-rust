@@ -24,9 +24,9 @@ use crate::queue::{self, QueueError};
 enum Pending {
   None,
   Store {
-    msgid:             u16,
-    sop_class_uid:     String,
-    sop_instance_uid:  String,
+    msgid:            u16,
+    sop_class_uid:    String,
+    sop_instance_uid: String,
   },
   Find {
     msgid:         u16,
@@ -355,19 +355,15 @@ where
                 let identifier = dataset_buffer.clone();
                 dataset_buffer.clear();
                 if let Some(qr_client) = qr.as_ref() {
-                  if let Err(e) = qr::proxy_find(
-                    &mut association,
-                    pc_id,
-                    msgid,
-                    &sop_class_uid,
-                    &identifier,
-                    qr_client,
-                    &cfg.ae_title,
-                    cfg.max_pdu_length,
-                    &log,
-                  )
-                  .await
-                  {
+                  let req = qr::QrProxyRequest {
+                    inbound_pc_id:    pc_id,
+                    inbound_msgid:    msgid,
+                    sop_class_uid:    &sop_class_uid,
+                    identifier:       &identifier,
+                    calling_ae_title: &cfg.ae_title,
+                    max_pdu_length:   cfg.max_pdu_length,
+                  };
+                  if let Err(e) = qr::proxy_find(&mut association, &req, qr_client, &log).await {
                     warn!(log, "C-FIND proxy failed"; "error" => %e);
                     let _ = qr::refuse_find(&mut association, pc_id, msgid, &sop_class_uid).await;
                   }
@@ -383,19 +379,15 @@ where
                 let identifier = dataset_buffer.clone();
                 dataset_buffer.clear();
                 if let Some(qr_client) = qr.as_ref() {
-                  if let Err(e) = qr::proxy_get(
-                    &mut association,
-                    pc_id,
-                    msgid,
-                    &sop_class_uid,
-                    &identifier,
-                    qr_client,
-                    &cfg.ae_title,
-                    cfg.max_pdu_length,
-                    &log,
-                  )
-                  .await
-                  {
+                  let req = qr::QrProxyRequest {
+                    inbound_pc_id:    pc_id,
+                    inbound_msgid:    msgid,
+                    sop_class_uid:    &sop_class_uid,
+                    identifier:       &identifier,
+                    calling_ae_title: &cfg.ae_title,
+                    max_pdu_length:   cfg.max_pdu_length,
+                  };
+                  if let Err(e) = qr::proxy_get(&mut association, &req, qr_client, &log).await {
                     warn!(log, "C-GET proxy failed"; "error" => %e);
                     let _ = qr::refuse_get(&mut association, pc_id, msgid, &sop_class_uid).await;
                   }

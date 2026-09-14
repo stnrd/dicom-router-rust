@@ -8,8 +8,7 @@ use dicom_encoding::TransferSyntaxIndex;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use dicom_ul::association::client::{AsyncTlsStream, ClientAssociationOptions};
 use dicom_ul::association::AsyncClientAssociation;
-use dicom_ul::pdu::PresentationContextNegotiated;
-use dicom_ul::pdu::{PDataValue, PDataValueType};
+use dicom_ul::pdu::{PDataValue, PDataValueType, PresentationContextNegotiated};
 use dicom_ul::Pdu;
 use slog::{debug, info, warn, Logger};
 use snafu::Snafu;
@@ -32,10 +31,11 @@ pub struct RoleSelection {
   pub scp:       bool,
 }
 
-/// Outbound association over TLS or cleartext TCP, depending on destination config.
+/// Outbound association over TLS or cleartext TCP, depending on destination
+/// config.
 pub enum ClientAssoc {
-  Tls(AsyncClientAssociation<AsyncTlsStream>),
-  Plain(AsyncClientAssociation<tokio::net::TcpStream>),
+  Tls(Box<AsyncClientAssociation<AsyncTlsStream>>),
+  Plain(Box<AsyncClientAssociation<tokio::net::TcpStream>>),
 }
 
 impl ClientAssoc {
@@ -66,7 +66,6 @@ impl ClientAssoc {
       Self::Plain(a) => a.receive().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
     }
   }
-
 }
 
 #[derive(Debug, Clone)]
@@ -144,15 +143,7 @@ pub async fn connect(
   max_pdu_length: u32,
   pcs: &[PresentationKey],
 ) -> Result<ClientAssoc, ScuError> {
-  connect_with_roles(
-    destination,
-    client_tls,
-    calling_ae_title,
-    max_pdu_length,
-    pcs,
-    &[],
-  )
-  .await
+  connect_with_roles(destination, client_tls, calling_ae_title, max_pdu_length, pcs, &[]).await
 }
 
 pub async fn connect_with_roles(
@@ -193,7 +184,7 @@ pub async fn connect_with_roles(
         ae_address: ae_address.clone(),
         source:     Box::new(e),
       })
-      .map(ClientAssoc::Tls)
+      .map(|assoc| ClientAssoc::Tls(Box::new(assoc)))
   } else {
     options
       .establish_with_async(&ae_address)
@@ -202,7 +193,7 @@ pub async fn connect_with_roles(
         ae_address: ae_address.clone(),
         source:     Box::new(e),
       })
-      .map(ClientAssoc::Plain)
+      .map(|assoc| ClientAssoc::Plain(Box::new(assoc)))
   }
 }
 

@@ -85,7 +85,8 @@ impl dicom_ul::association::server::Negotiation for AcceptStorageScp {
   }
 }
 
-/// In-process TLS C-FIND/C-GET SCP that records identifiers and can push C-STORE during GET.
+/// In-process TLS C-FIND/C-GET SCP that records identifiers and can push
+/// C-STORE during GET.
 pub struct TestQrScp {
   pub port:   u16,
   pub finds:  Arc<Mutex<Vec<Vec<u8>>>>,
@@ -146,7 +147,7 @@ pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrS
         let mut store_msgid = 1u16;
         loop {
           match assoc.receive().await {
-            Ok(Pdu::PData { mut data }) => {
+            Ok(Pdu::PData { mut data }) =>
               for dv in &mut data {
                 if dv.value_type == PDataValueType::Command && dv.is_last {
                   let cmd = dicom_router::dimse::decode_command(&dv.data).unwrap();
@@ -161,13 +162,9 @@ pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrS
                       .unwrap()
                       .to_string();
                     buf.clear();
-                  } else if command_field == dicom_router::dimse::C_FIND_RQ {
-                    msgid = dicom_router::dimse::uint16(&cmd, dicom_router::dimse::TAG_MESSAGE_ID).unwrap();
-                    class = dicom_router::dimse::string(&cmd, dicom_router::dimse::TAG_AFFECTED_SOP_CLASS_UID)
-                      .unwrap()
-                      .to_string();
-                    buf.clear();
-                  } else if command_field == dicom_router::dimse::C_GET_RQ {
+                  } else if command_field == dicom_router::dimse::C_FIND_RQ
+                    || command_field == dicom_router::dimse::C_GET_RQ
+                  {
                     msgid = dicom_router::dimse::uint16(&cmd, dicom_router::dimse::TAG_MESSAGE_ID).unwrap();
                     class = dicom_router::dimse::string(&cmd, dicom_router::dimse::TAG_AFFECTED_SOP_CLASS_UID)
                       .unwrap()
@@ -190,9 +187,9 @@ pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrS
                           .send(&Pdu::PData {
                             data: vec![PDataValue {
                               presentation_context_id: pc_id,
-                              value_type: PDataValueType::Command,
-                              is_last: true,
-                              data: dicom_router::dimse::encode_command(&rsp),
+                              value_type:              PDataValueType::Command,
+                              is_last:                 true,
+                              data:                    dicom_router::dimse::encode_command(&rsp),
                             }],
                           })
                           .await
@@ -212,15 +209,15 @@ pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrS
                             data: vec![
                               PDataValue {
                                 presentation_context_id: pc_id,
-                                value_type: PDataValueType::Command,
-                                is_last: true,
-                                data: dicom_router::dimse::encode_command(&pending_rsp),
+                                value_type:              PDataValueType::Command,
+                                is_last:                 true,
+                                data:                    dicom_router::dimse::encode_command(&pending_rsp),
                               },
                               PDataValue {
                                 presentation_context_id: pc_id,
-                                value_type: PDataValueType::Data,
-                                is_last: true,
-                                data: pending_ident,
+                                value_type:              PDataValueType::Data,
+                                is_last:                 true,
+                                data:                    pending_ident,
                               },
                             ],
                           })
@@ -236,9 +233,9 @@ pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrS
                           .send(&Pdu::PData {
                             data: vec![PDataValue {
                               presentation_context_id: pc_id,
-                              value_type: PDataValueType::Command,
-                              is_last: true,
-                              data: dicom_router::dimse::encode_command(&success_rsp),
+                              value_type:              PDataValueType::Command,
+                              is_last:                 true,
+                              data:                    dicom_router::dimse::encode_command(&success_rsp),
                             }],
                           })
                           .await
@@ -270,33 +267,30 @@ pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrS
                             data: vec![
                               PDataValue {
                                 presentation_context_id: ct_pc.id,
-                                value_type: PDataValueType::Command,
-                                is_last: true,
-                                data: dicom_router::dimse::encode_command(&store_cmd),
+                                value_type:              PDataValueType::Command,
+                                is_last:                 true,
+                                data:                    dicom_router::dimse::encode_command(&store_cmd),
                               },
                               PDataValue {
                                 presentation_context_id: ct_pc.id,
-                                value_type: PDataValueType::Data,
-                                is_last: true,
-                                data: object_data,
+                                value_type:              PDataValueType::Data,
+                                is_last:                 true,
+                                data:                    object_data,
                               },
                             ],
                           })
                           .await
                           .unwrap();
-                        loop {
-                          match assoc.receive().await.unwrap() {
-                            Pdu::PData { data } => {
-                              let rsp = dicom_router::dimse::decode_command(&data[0].data).unwrap();
-                              assert_eq!(
-                                dicom_router::dimse::command_field(&rsp),
-                                Some(dicom_router::dimse::C_STORE_RSP)
-                              );
-                              break;
-                            }
-                            Pdu::ReleaseRQ => panic!("unexpected release during C-GET"),
-                            other => panic!("unexpected {other:?} during C-GET"),
+                        match assoc.receive().await.unwrap() {
+                          Pdu::PData { data } => {
+                            let rsp = dicom_router::dimse::decode_command(&data[0].data).unwrap();
+                            assert_eq!(
+                              dicom_router::dimse::command_field(&rsp),
+                              Some(dicom_router::dimse::C_STORE_RSP)
+                            );
                           }
+                          Pdu::ReleaseRQ => panic!("unexpected release during C-GET"),
+                          other => panic!("unexpected {other:?} during C-GET"),
                         }
                         let get_rsp = dicom_router::dimse::create_cget_rsp(
                           msgid,
@@ -311,9 +305,9 @@ pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrS
                           .send(&Pdu::PData {
                             data: vec![PDataValue {
                               presentation_context_id: pc_id,
-                              value_type: PDataValueType::Command,
-                              is_last: true,
-                              data: dicom_router::dimse::encode_command(&get_rsp),
+                              value_type:              PDataValueType::Command,
+                              is_last:                 true,
+                              data:                    dicom_router::dimse::encode_command(&get_rsp),
                             }],
                           })
                           .await
@@ -323,8 +317,7 @@ pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrS
                     }
                   }
                 }
-              }
-            }
+              },
             Ok(Pdu::ReleaseRQ) => {
               let _ = assoc.send(&Pdu::ReleaseRP).await;
               break;
@@ -442,7 +435,8 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
   }
 }
 
-/// In-process cleartext C-STORE SCP (no TLS) that records received SOP Instance UIDs.
+/// In-process cleartext C-STORE SCP (no TLS) that records received SOP Instance
+/// UIDs.
 pub async fn start_test_scp_plain() -> TestScp {
   use dicom_ul::association::server::ServerAssociationOptions;
   use dicom_ul::pdu::{PDataValue, PDataValueType};

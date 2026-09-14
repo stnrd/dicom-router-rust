@@ -4,7 +4,8 @@
 //! is supplied, [`build_server_config`] wires up a [`WebPkiClientVerifier`] so
 //! unauthenticated clients are rejected at the handshake. Outbound (client) TLS
 //! verifies the destination when `destinations[].tls` is true; cleartext
-//! destinations skip this module. mTLS client certs are optional per destination.
+//! destinations skip this module. mTLS client certs are optional per
+//! destination.
 
 use std::fs::File;
 use std::io::BufReader;

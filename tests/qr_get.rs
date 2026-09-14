@@ -155,10 +155,7 @@ query_retrieve:
             continue;
           }
           assert_eq!(dimse::uint16(&c, dimse::TAG_MESSAGE_ID_BEING_RESPONDED_TO), Some(11));
-          assert_eq!(
-            dimse::uint16(&c, dimse::TAG_NUMBER_OF_COMPLETED_SUBOPERATIONS),
-            Some(1)
-          );
+          assert_eq!(dimse::uint16(&c, dimse::TAG_NUMBER_OF_COMPLETED_SUBOPERATIONS), Some(1));
           break;
         } else {
           panic!("unexpected command {command_field:#06x}");

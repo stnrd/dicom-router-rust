@@ -293,11 +293,7 @@ pub fn create_cfind_rsp(
   cmd.set_u16(TAG_MESSAGE_ID_BEING_RESPONDED_TO, message_id_being_responded_to);
   cmd.set_u16(
     TAG_COMMAND_DATA_SET_TYPE,
-    if dataset_present {
-      DATA_SET_PRESENT
-    } else {
-      NO_DATA_SET
-    },
+    if dataset_present { DATA_SET_PRESENT } else { NO_DATA_SET },
   );
   cmd.set_u16(TAG_STATUS, status);
   cmd
@@ -581,15 +577,7 @@ mod tests {
 
   #[test]
   fn cget_rsp_pending_includes_subop_counts() {
-    let cmd = create_cget_rsp(
-      9,
-      STUDY_ROOT_GET_SOP_CLASS_UID,
-      STATUS_PENDING,
-      4,
-      1,
-      0,
-      0,
-    );
+    let cmd = create_cget_rsp(9, STUDY_ROOT_GET_SOP_CLASS_UID, STATUS_PENDING, 4, 1, 0, 0);
     let decoded = decode_command(&encode_command(&cmd)).expect("decode C-GET-RSP");
     assert_eq!(command_field(&decoded), Some(C_GET_RSP));
     assert_eq!(uint16(&decoded, TAG_STATUS), Some(STATUS_PENDING));

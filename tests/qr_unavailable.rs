@@ -105,18 +105,15 @@ async fn cfind_refused_when_destination_unreachable() {
     .unwrap();
 
   let mut statuses = Vec::new();
-  loop {
-    match assoc.receive().await.unwrap() {
-      Pdu::PData { data } => {
-        let c = dimse::decode_command(&data[0].data).unwrap();
-        assert_eq!(dimse::command_field(&c), Some(dimse::C_FIND_RSP));
-        assert_eq!(dimse::uint16(&c, dimse::TAG_MESSAGE_ID_BEING_RESPONDED_TO), Some(7));
-        let st = dimse::uint16(&c, dimse::TAG_STATUS).unwrap();
-        statuses.push(st);
-        break;
-      }
-      other => panic!("unexpected {other:?}"),
+  match assoc.receive().await.unwrap() {
+    Pdu::PData { data } => {
+      let c = dimse::decode_command(&data[0].data).unwrap();
+      assert_eq!(dimse::command_field(&c), Some(dimse::C_FIND_RSP));
+      assert_eq!(dimse::uint16(&c, dimse::TAG_MESSAGE_ID_BEING_RESPONDED_TO), Some(7));
+      let st = dimse::uint16(&c, dimse::TAG_STATUS).unwrap();
+      statuses.push(st);
     }
+    other => panic!("unexpected {other:?}"),
   }
   let _ = assoc.release().await;
   router.token.cancel();

@@ -4,14 +4,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::scu::ClientAssoc;
 use slog::{error, info, o, warn, Logger};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Destination;
 use crate::queue::SpooledObject;
-use crate::scu::{self, ScuError, SpooledMeta};
+use crate::scu::{self, ClientAssoc, ScuError, SpooledMeta};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const JOB_CHANNEL_SIZE: usize = 64;

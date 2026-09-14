@@ -38,7 +38,8 @@ pub struct Config {
   pub min_free_bytes:              u64,
   #[serde(default)]
   pub retry:                       RetryConfig,
-  /// Inbound TLS settings. When `tls.enabled` is false, associations are plain DICOM.
+  /// Inbound TLS settings. When `tls.enabled` is false, associations are plain
+  /// DICOM.
   pub tls:                         ServerTls,
   /// Forwarding destinations (at least one).
   pub destinations:                Vec<Destination>,
@@ -53,7 +54,8 @@ pub struct ServerTls {
   /// When false, inbound associations use cleartext DICOM (typical port 104).
   #[serde(default = "default_true")]
   pub enabled:     bool,
-  /// PEM certificate chain presented to inbound clients (required when `enabled`).
+  /// PEM certificate chain presented to inbound clients (required when
+  /// `enabled`).
   #[serde(default)]
   pub server_cert: Option<PathBuf>,
   /// PEM private key for the server certificate (required when `enabled`).
@@ -79,7 +81,8 @@ pub struct Destination {
   pub tls:              bool,
   /// TLS server name (SNI / certificate verification). Defaults to `host`.
   pub server_name:      Option<String>,
-  /// PEM CA bundle used to verify the destination's certificate (required when `tls`).
+  /// PEM CA bundle used to verify the destination's certificate (required when
+  /// `tls`).
   #[serde(default)]
   pub ca_cert:          Option<PathBuf>,
   /// Optional client certificate/key for destinations requiring mTLS.
