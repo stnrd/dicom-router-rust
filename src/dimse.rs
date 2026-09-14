@@ -19,6 +19,9 @@ use snafu::Snafu;
 
 pub const C_STORE_RQ: u16 = 0x0001;
 pub const C_STORE_RSP: u16 = 0x8001;
+pub const C_FIND_RQ: u16 = 0x0020;
+pub const C_FIND_RSP: u16 = 0x8020;
+pub const C_CANCEL_RQ: u16 = 0x0FFF;
 pub const C_ECHO_RQ: u16 = 0x0030;
 pub const C_ECHO_RSP: u16 = 0x8030;
 
@@ -26,6 +29,7 @@ pub const C_ECHO_RSP: u16 = 0x8030;
 // --------------------------------------------------
 
 pub const STATUS_SUCCESS: u16 = 0x0000;
+pub const STATUS_PENDING: u16 = 0xFF00;
 pub const STATUS_OUT_OF_RESOURCES: u16 = 0xA700;
 pub const STATUS_CANNOT_UNDERSTAND: u16 = 0xC000;
 
@@ -53,6 +57,11 @@ pub const TAG_AFFECTED_SOP_INSTANCE_UID: Tag = (0x0000, 0x1000);
 
 /// SOP Class UID of the DICOM Verification Service Class (used by C-ECHO).
 pub const VERIFICATION_SOP_CLASS_UID: &str = "1.2.840.10008.1.1";
+
+/// Patient Root Query/Retrieve Information Model – FIND.
+pub const PATIENT_ROOT_FIND_SOP_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.2.1.1";
+/// Study Root Query/Retrieve Information Model – FIND.
+pub const STUDY_ROOT_FIND_SOP_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.2.2.1";
 
 /// Default priority (PS3.7 9.3.1.1): `MEDIUM`.
 pub const PRIORITY_MEDIUM: u16 = 0x0000;
@@ -242,6 +251,40 @@ pub fn create_cecho_rsp(message_id_being_responded_to: u16, status: u16) -> Comm
   cmd.set_u16(TAG_COMMAND_FIELD, C_ECHO_RSP);
   cmd.set_u16(TAG_MESSAGE_ID_BEING_RESPONDED_TO, message_id_being_responded_to);
   cmd.set_u16(TAG_COMMAND_DATA_SET_TYPE, NO_DATA_SET);
+  cmd.set_u16(TAG_STATUS, status);
+  cmd
+}
+
+/// Build a C-FIND-RQ command set.
+pub fn create_cfind_rq(message_id: u16, affected_sop_class_uid: &str, priority: u16) -> CommandSet {
+  let mut cmd = CommandSet::new();
+  cmd.set_str(TAG_AFFECTED_SOP_CLASS_UID, affected_sop_class_uid);
+  cmd.set_u16(TAG_COMMAND_FIELD, C_FIND_RQ);
+  cmd.set_u16(TAG_MESSAGE_ID, message_id);
+  cmd.set_u16(TAG_PRIORITY, priority);
+  cmd.set_u16(TAG_COMMAND_DATA_SET_TYPE, DATA_SET_PRESENT);
+  cmd
+}
+
+/// Build a C-FIND-RSP command set.
+pub fn create_cfind_rsp(
+  message_id_being_responded_to: u16,
+  affected_sop_class_uid: &str,
+  status: u16,
+  dataset_present: bool,
+) -> CommandSet {
+  let mut cmd = CommandSet::new();
+  cmd.set_str(TAG_AFFECTED_SOP_CLASS_UID, affected_sop_class_uid);
+  cmd.set_u16(TAG_COMMAND_FIELD, C_FIND_RSP);
+  cmd.set_u16(TAG_MESSAGE_ID_BEING_RESPONDED_TO, message_id_being_responded_to);
+  cmd.set_u16(
+    TAG_COMMAND_DATA_SET_TYPE,
+    if dataset_present {
+      DATA_SET_PRESENT
+    } else {
+      NO_DATA_SET
+    },
+  );
   cmd.set_u16(TAG_STATUS, status);
   cmd
 }
@@ -442,5 +485,36 @@ mod tests {
     let mut bytes = encode_command(&cmd);
     bytes.truncate(bytes.len() - 1);
     assert!(decode_command(&bytes).is_err());
+  }
+
+  #[test]
+  fn cfind_rq_roundtrip() {
+    let cmd = create_cfind_rq(3, STUDY_ROOT_FIND_SOP_CLASS_UID, PRIORITY_MEDIUM);
+    let decoded = decode_command(&encode_command(&cmd)).expect("decode C-FIND-RQ");
+    assert_eq!(command_field(&decoded), Some(C_FIND_RQ));
+    assert_eq!(uint16(&decoded, TAG_MESSAGE_ID), Some(3));
+    assert_eq!(uint16(&decoded, TAG_COMMAND_DATA_SET_TYPE), Some(DATA_SET_PRESENT));
+    assert_eq!(
+      string(&decoded, TAG_AFFECTED_SOP_CLASS_UID),
+      Some(STUDY_ROOT_FIND_SOP_CLASS_UID)
+    );
+  }
+
+  #[test]
+  fn cfind_rsp_pending_has_dataset() {
+    let cmd = create_cfind_rsp(3, STUDY_ROOT_FIND_SOP_CLASS_UID, STATUS_PENDING, true);
+    let decoded = decode_command(&encode_command(&cmd)).expect("decode C-FIND-RSP");
+    assert_eq!(command_field(&decoded), Some(C_FIND_RSP));
+    assert_eq!(uint16(&decoded, TAG_MESSAGE_ID_BEING_RESPONDED_TO), Some(3));
+    assert_eq!(uint16(&decoded, TAG_STATUS), Some(STATUS_PENDING));
+    assert_eq!(uint16(&decoded, TAG_COMMAND_DATA_SET_TYPE), Some(DATA_SET_PRESENT));
+  }
+
+  #[test]
+  fn cfind_rsp_success_has_no_dataset() {
+    let cmd = create_cfind_rsp(3, STUDY_ROOT_FIND_SOP_CLASS_UID, STATUS_SUCCESS, false);
+    let decoded = decode_command(&encode_command(&cmd)).expect("decode C-FIND-RSP");
+    assert_eq!(uint16(&decoded, TAG_STATUS), Some(STATUS_SUCCESS));
+    assert_eq!(uint16(&decoded, TAG_COMMAND_DATA_SET_TYPE), Some(NO_DATA_SET));
   }
 }
