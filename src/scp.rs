@@ -6,7 +6,7 @@ use dicom_dictionary_std::uids;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
-use dicom_ul::association::server::{AcceptAny, DefaultNegotiation, ServerAssociationOptions};
+use dicom_ul::association::server::{AcceptAny, Negotiation, ServerAssociationOptions};
 use dicom_ul::association::{Association, AsyncServerAssociation};
 use dicom_ul::pdu::{PDataValue, PDataValueType, PresentationContextResultReason};
 use dicom_ul::Pdu;
@@ -33,6 +33,28 @@ enum Pending {
     sop_class_uid: String,
     pc_id:         u8,
   },
+  Get {
+    msgid:         u16,
+    sop_class_uid: String,
+    pc_id:         u8,
+  },
+}
+
+#[derive(Clone)]
+struct EchoRoles;
+
+impl Negotiation for EchoRoles {
+  fn negotiate_roles(
+    &self,
+    _sop_class_uid: &str,
+    scu_role: bool,
+    scp_role: bool,
+  ) -> Option<dicom_ul::pdu::RequestorRoles> {
+    Some(dicom_ul::pdu::RequestorRoles {
+      scu: scu_role,
+      scp: scp_role,
+    })
+  }
 }
 
 #[derive(Debug, Snafu)]
@@ -90,12 +112,13 @@ fn server_options(
   cfg: &Config,
   tls: Arc<rustls::ServerConfig>,
   qr: Option<&QrClient>,
-) -> ServerAssociationOptions<'static, AcceptAny, DefaultNegotiation> {
+) -> ServerAssociationOptions<'static, AcceptAny, EchoRoles> {
   let mut options = ServerAssociationOptions::new()
     .accept_any()
     .ae_title(cfg.ae_title.clone())
     .max_pdu_length(cfg.max_pdu_length)
     .promiscuous(cfg.promiscuous)
+    .with_negotiation(EchoRoles)
     .tls_config(tls);
   for ts in TransferSyntaxRegistry.iter() {
     if !ts.is_unsupported() {
@@ -251,6 +274,15 @@ where
                 pc_id:         data_value.presentation_context_id,
               };
               dataset_buffer.clear();
+            } else if command_field == dimse::C_GET_RQ {
+              pending = Pending::Get {
+                msgid:         dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0),
+                sop_class_uid: dimse::string(&obj, TAG_AFFECTED_SOP_CLASS_UID)
+                  .unwrap_or("")
+                  .to_string(),
+                pc_id:         data_value.presentation_context_id,
+              };
+              dataset_buffer.clear();
             } else {
               warn!(
                   log,
@@ -316,6 +348,34 @@ where
                   }
                 } else {
                   let _ = qr::refuse_find(&mut association, pc_id, msgid, &sop_class_uid).await;
+                }
+              }
+              Pending::Get {
+                msgid,
+                sop_class_uid,
+                pc_id,
+              } => {
+                let identifier = dataset_buffer.clone();
+                dataset_buffer.clear();
+                if let Some(qr_client) = qr.as_ref() {
+                  if let Err(e) = qr::proxy_get(
+                    &mut association,
+                    pc_id,
+                    msgid,
+                    &sop_class_uid,
+                    &identifier,
+                    qr_client,
+                    &cfg.ae_title,
+                    cfg.max_pdu_length,
+                    &log,
+                  )
+                  .await
+                  {
+                    warn!(log, "C-GET proxy failed"; "error" => %e);
+                    let _ = qr::refuse_get(&mut association, pc_id, msgid, &sop_class_uid).await;
+                  }
+                } else {
+                  let _ = qr::refuse_get(&mut association, pc_id, msgid, &sop_class_uid).await;
                 }
               }
               Pending::None => {
