@@ -35,3 +35,8 @@ destinations:
     port: 2762
     ca_cert: "/etc/dicom-router/tls/pacs-ca.crt"
     # source_ae_titles: ["CT_SCANNER_1"]  # optional filter by calling AE
+
+# Optional: proxy inbound C-FIND / C-GET (Patient Root and Study Root) to this
+# destination. Omit the whole block to keep C-STORE/C-ECHO-only behaviour.
+# query_retrieve:
+#   destination: pacs-main
