@@ -73,14 +73,16 @@ pub const ABSTRACT_SYNTAXES: &[&str] = &[
 
 fn server_options(
   cfg: &Config,
-  tls: Arc<rustls::ServerConfig>,
+  tls: Option<Arc<rustls::ServerConfig>>,
 ) -> ServerAssociationOptions<'static, AcceptAny, DefaultNegotiation> {
   let mut options = ServerAssociationOptions::new()
     .accept_any()
     .ae_title(cfg.ae_title.clone())
     .max_pdu_length(cfg.max_pdu_length)
-    .promiscuous(cfg.promiscuous)
-    .tls_config(tls);
+    .promiscuous(cfg.promiscuous);
+  if let Some(tls_cfg) = tls {
+    options = options.tls_config(tls_cfg);
+  }
   for ts in TransferSyntaxRegistry.iter() {
     if !ts.is_unsupported() {
       options = options.with_transfer_syntax(ts.uid());
@@ -95,16 +97,18 @@ fn server_options(
 /// Bind the listener and spawn the accept loop.
 pub async fn spawn(
   cfg: Arc<Config>,
-  tls: Arc<rustls::ServerConfig>,
+  tls: Option<Arc<rustls::ServerConfig>>,
   log: Logger,
   shutdown: CancellationToken,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
   let listener = TcpListener::bind(&cfg.listen_addr).await?;
+  let inbound_tls = tls.is_some();
   info!(
       log,
-      "listening for DICOM TLS associations";
+      "listening for DICOM associations";
       "listen_addr" => &cfg.listen_addr,
-      "ae_title" => &cfg.ae_title
+      "ae_title" => &cfg.ae_title,
+      "tls" => inbound_tls
   );
   let options = server_options(&cfg, tls);
   let conn_sem = Arc::new(Semaphore::new(cfg.max_concurrent_associations));
@@ -136,27 +140,16 @@ pub async fn spawn(
               let options = options.clone();
               connections.spawn(async move {
                   let _permit = permit;
-                  match options.establish_tls_async(stream).await {
-                      Ok(association) => {
-                          let peer_ae = association.peer_ae_title().to_string();
-                          let alog = conn_log.new(o!("calling_ae" => peer_ae.clone()));
-                          info!(
-                              alog,
-                              "association established";
-                              "accepted_presentation_contexts" => association
-                                  .presentation_contexts()
-                                  .iter()
-                                  .filter(|pc| pc.reason == PresentationContextResultReason::Acceptance)
-                                  .count() as u64
-                          );
-                          if let Err(e) = handle_association(association, &cfg, alog.clone()).await {
-                              warn!(alog, "association ended with error"; "error" => %e);
-                          }
-                          info!(alog, "association closed");
-                      }
-                      Err(e) => {
-                          debug!(conn_log, "association rejected"; "error" => %e);
-                      }
+                  if inbound_tls {
+                    match options.establish_tls_async(stream).await {
+                      Ok(association) => serve(association, &cfg, &conn_log).await,
+                      Err(e) => debug!(conn_log, "association rejected"; "error" => %e),
+                    }
+                  } else {
+                    match options.establish_async(stream).await {
+                      Ok(association) => serve(association, &cfg, &conn_log).await,
+                      Err(e) => debug!(conn_log, "association rejected"; "error" => %e),
+                    }
                   }
               });
           }
@@ -166,6 +159,27 @@ pub async fn spawn(
     info!(log, "SCP accept loop stopped");
   });
   Ok(handle)
+}
+
+async fn serve<S>(association: AsyncServerAssociation<S>, cfg: &Config, conn_log: &Logger)
+where
+  S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+  let peer_ae = association.peer_ae_title().to_string();
+  let alog = conn_log.new(o!("calling_ae" => peer_ae));
+  info!(
+      alog,
+      "association established";
+      "accepted_presentation_contexts" => association
+          .presentation_contexts()
+          .iter()
+          .filter(|pc| pc.reason == PresentationContextResultReason::Acceptance)
+          .count() as u64
+  );
+  if let Err(e) = handle_association(association, cfg, alog.clone()).await {
+    warn!(alog, "association ended with error"; "error" => %e);
+  }
+  info!(alog, "association closed");
 }
 
 async fn handle_association<S>(mut association: AsyncServerAssociation<S>, cfg: &Config, log: Logger) -> Result<()>

@@ -2,7 +2,7 @@
 name = "dicom-router"
 version = "0.1.0"
 edition = "2021"
-description = "Secure TLS-only DICOM C-STORE router"
+description = "DICOM C-STORE router with configurable TLS per direction"
 publish = false
 rust-version = "1.98"
 

@@ -41,14 +41,26 @@ async fn async_main(cfg: config::Config, log: slog::Logger) -> i32 {
   let cfg = Arc::new(cfg);
   let shutdown = CancellationToken::new();
 
-  let server_tls =
-    match tls::build_server_config(&cfg.tls.server_cert, &cfg.tls.server_key, cfg.tls.client_ca.as_deref()) {
-      Ok(c) => c,
+  let server_tls = if cfg.tls.enabled {
+    match tls::build_server_config(
+      cfg.tls.server_cert.as_ref().expect("validated"),
+      cfg.tls.server_key.as_ref().expect("validated"),
+      cfg.tls.client_ca.as_deref(),
+    ) {
+      Ok(c) => Some(c),
       Err(e) => {
         error!(log, "failed to build server TLS config"; "error" => %e);
         return 2;
       }
-    };
+    }
+  } else {
+    warn!(log, "inbound TLS disabled: accepting cleartext DICOM"; "listen_addr" => &cfg.listen_addr);
+    None
+  };
+
+  for dest in cfg.destinations.iter().filter(|d| !d.tls) {
+    warn!(log, "outbound TLS disabled: sending cleartext DICOM"; "destination" => &dest.name);
+  }
 
   for dest in &cfg.destinations {
     if let Err(e) = std::fs::create_dir_all(cfg.queue_dir_for(&dest.name)) {
@@ -105,9 +117,13 @@ async fn async_main(cfg: config::Config, log: slog::Logger) -> i32 {
 
   let mut dispatcher_handles = Vec::new();
   for dest in &cfg.destinations {
-    let client_tls =
-      match tls::build_client_config(&dest.ca_cert, dest.client_cert.as_deref(), dest.client_key.as_deref()) {
-        Ok(c) => c,
+    let client_tls = if dest.tls {
+      match tls::build_client_config(
+        dest.ca_cert.as_ref().expect("validated"),
+        dest.client_cert.as_deref(),
+        dest.client_key.as_deref(),
+      ) {
+        Ok(c) => Some(c),
         Err(e) => {
           error!(
               log,
@@ -119,7 +135,10 @@ async fn async_main(cfg: config::Config, log: slog::Logger) -> i32 {
           let _ = scp_handle.await;
           return 2;
         }
-      };
+      }
+    } else {
+      None
+    };
     dispatcher_handles.push(dispatcher::spawn(dispatcher::WorkerConfig {
       destination: dest.clone(),
       client_tls,

@@ -2,45 +2,39 @@ mod common;
 
 use std::sync::Arc;
 
-use dicom_router::{config, queue, scp, tls};
+use dicom_router::{config, dispatcher, scp};
 use dicom_ul::association::client::ClientAssociationOptions;
 use dicom_ul::pdu::{PDataValue, PDataValueType};
 use dicom_ul::Pdu;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
-async fn fan_out_spools_to_both_destinations() {
+async fn end_to_end_cleartext_loopback() {
   let dir = tempfile::tempdir().unwrap();
-  let pki = common::write_pki(dir.path());
-  let queue_root = dir.path().join("queue");
-  std::fs::create_dir_all(&queue_root).unwrap();
+  let dest_scp = common::start_test_scp_plain().await;
 
   let yaml = format!(
     r#"
-listen_addr: "127.0.0.1:12771"
-ae_title: "FANOUT-RTR"
+listen_addr: "127.0.0.1:12790"
+ae_title: "CLR-ROUTER"
 queue_dir: "{q}"
 dead_letter_dir: "{d}"
+retry:
+  initial_delay_ms: 20
+  max_delay_ms: 50
+  max_attempts: 5
 tls:
-  server_cert: "{sc}"
-  server_key: "{sk}"
+  enabled: false
 destinations:
-  - name: dest-a
-    ae_title: "DEST-A"
+  - name: loop-dest
+    ae_title: "TEST-DEST"
     host: 127.0.0.1
-    port: 1
-    ca_cert: "{ca}"
-  - name: dest-b
-    ae_title: "DEST-B"
-    host: 127.0.0.1
-    port: 2
-    ca_cert: "{ca}"
+    port: {port}
+    tls: false
 "#,
-    q = queue_root.display(),
+    q = dir.path().join("queue").display(),
     d = dir.path().join("dead").display(),
-    sc = pki.server_cert.display(),
-    sk = pki.server_key.display(),
-    ca = pki.ca.display(),
+    port = dest_scp.port,
   );
   let cfg: config::Config = serde_yaml::from_str(&yaml).unwrap();
   cfg.validate().unwrap();
@@ -48,20 +42,26 @@ destinations:
 
   let token = CancellationToken::new();
   let log = slog::Logger::root(slog::Discard, slog::o!());
-  let server_tls = tls::build_server_config(&pki.server_cert, &pki.server_key, None).unwrap();
-  let client_tls = tls::build_client_config(&pki.ca, None, None).unwrap();
-  let _scp = scp::spawn(cfg.clone(), Some(server_tls), log.clone(), token.clone())
-    .await
-    .unwrap();
+  let _scp = scp::spawn(cfg.clone(), None, log.clone(), token.clone()).await.unwrap();
+  let _disp = dispatcher::spawn(dispatcher::WorkerConfig {
+    destination:          cfg.destinations[0].clone(),
+    client_tls:           None,
+    queue_root:           cfg.queue_dir.clone(),
+    dead_letter_dir:      cfg.dead_letter_dir.clone(),
+    retry_cfg:            cfg.retry.clone(),
+    calling_ae_title:     cfg.ae_title.clone(),
+    max_pdu_length:       cfg.max_pdu_length,
+    max_concurrent_sends: cfg.max_concurrent_sends,
+    log:                  log.clone(),
+    shutdown:             token.clone(),
+  });
 
   let mut assoc = ClientAssociationOptions::new()
-    .calling_ae_title("FANOUT-SCU")
+    .calling_ae_title("CLR-SCU")
     .with_presentation_context(dicom_dictionary_std::uids::CT_IMAGE_STORAGE, vec![
       dicom_dictionary_std::uids::EXPLICIT_VR_LITTLE_ENDIAN,
     ])
-    .tls_config(client_tls)
-    .server_name("localhost")
-    .establish_with_async_tls("FANOUT-RTR@127.0.0.1:12771")
+    .establish_with_async("CLR-ROUTER@127.0.0.1:12790")
     .await
     .unwrap();
   let pc_id = assoc.presentation_contexts()[0].id;
@@ -69,7 +69,7 @@ destinations:
   let rq = dicom_router::dimse::encode_command(&dicom_router::dimse::create_cstore_rq(
     1,
     dicom_dictionary_std::uids::CT_IMAGE_STORAGE,
-    "1.2.3.88",
+    "1.2.3.100",
     dicom_router::dimse::PRIORITY_MEDIUM,
   ));
   let mut obj = dicom_object::InMemDicomObject::new_empty();
@@ -83,7 +83,7 @@ destinations:
   obj.put(DataElement::new(
     tags::SOP_INSTANCE_UID,
     VR::UI,
-    dicom_value!(Str, "1.2.3.88"),
+    dicom_value!(Str, "1.2.3.100"),
   ));
   let mut dataset = Vec::new();
   let ts = dicom_transfer_syntax_registry::entries::EXPLICIT_VR_LITTLE_ENDIAN.erased();
@@ -121,8 +121,19 @@ destinations:
   }
   assoc.release().await.unwrap();
 
-  assert_eq!(queue::scan(&cfg.queue_dir_for("dest-a")).unwrap().len(), 1);
-  assert_eq!(queue::scan(&cfg.queue_dir_for("dest-b")).unwrap().len(), 1);
-
+  let mut arrived = false;
+  for _ in 0..100 {
+    if !dest_scp.received.lock().unwrap().is_empty()
+      && dicom_router::queue::scan(&cfg.queue_dir_for("loop-dest"))
+        .unwrap()
+        .is_empty()
+    {
+      arrived = true;
+      break;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+  }
   token.cancel();
+  assert!(arrived, "destination never received object or queue did not drain");
+  assert_eq!(dest_scp.received.lock().unwrap().as_slice(), &["1.2.3.100".to_string()]);
 }
