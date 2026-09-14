@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use dicom_core::{dicom_value, DataElement, VR};
 use dicom_dictionary_std::{tags, uids};
+use dicom_encoding::TransferSyntaxIndex;
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
+use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 
 /// Build a minimal CT image for queue/forward tests.
@@ -38,6 +40,309 @@ pub fn test_object(sop_instance_uid: &str) -> dicom_object::FileDicomObject<InMe
     .build()
     .unwrap();
   obj.with_exact_meta(meta)
+}
+
+pub fn encode_find_identifier(patient_id: &str, study_instance_uid: Option<&str>) -> Vec<u8> {
+  let mut obj = InMemDicomObject::new_empty();
+  obj.put(DataElement::new(
+    tags::QUERY_RETRIEVE_LEVEL,
+    VR::CS,
+    dicom_value!(Str, "STUDY"),
+  ));
+  obj.put(DataElement::new(
+    tags::PATIENT_ID,
+    VR::LO,
+    dicom_value!(Str, patient_id),
+  ));
+  if let Some(uid) = study_instance_uid {
+    obj.put(DataElement::new(
+      tags::STUDY_INSTANCE_UID,
+      VR::UI,
+      dicom_value!(Str, uid),
+    ));
+  }
+  let ts = TransferSyntaxRegistry
+    .get(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+    .expect("EVRLE");
+  let mut buf = Vec::new();
+  obj.write_dataset_with_ts(&mut buf, ts).expect("encode identifier");
+  buf
+}
+
+struct AcceptStorageScp;
+
+impl dicom_ul::association::server::Negotiation for AcceptStorageScp {
+  fn negotiate_roles(
+    &self,
+    _sop_class_uid: &str,
+    scu_role: bool,
+    scp_role: bool,
+  ) -> Option<dicom_ul::pdu::RequestorRoles> {
+    Some(dicom_ul::pdu::RequestorRoles {
+      scu: scu_role,
+      scp: scp_role,
+    })
+  }
+}
+
+/// In-process TLS C-FIND/C-GET SCP that records identifiers and can push C-STORE during GET.
+pub struct TestQrScp {
+  pub port:   u16,
+  pub finds:  Arc<Mutex<Vec<Vec<u8>>>>,
+  pub gets:   Arc<Mutex<Vec<Vec<u8>>>>,
+  pub stored: Arc<Mutex<Vec<String>>>,
+  _handle:    tokio::task::JoinHandle<()>,
+}
+
+pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path) -> TestQrScp {
+  use dicom_ul::association::server::ServerAssociationOptions;
+  use dicom_ul::pdu::{PDataValue, PDataValueType};
+  use dicom_ul::Pdu;
+
+  let tls_cfg = dicom_router::tls::build_server_config(server_cert, server_key, None).expect("test QR SCP TLS config");
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    .await
+    .expect("bind test QR SCP");
+  let port = listener.local_addr().unwrap().port();
+  let finds = Arc::new(Mutex::new(Vec::new()));
+  let gets = Arc::new(Mutex::new(Vec::new()));
+  let stored = Arc::new(Mutex::new(Vec::new()));
+  let finds2 = finds.clone();
+  let gets2 = gets.clone();
+  let stored2 = stored.clone();
+
+  let handle = tokio::spawn(async move {
+    loop {
+      let (stream, _) = listener.accept().await.expect("accept");
+      let tls_cfg = tls_cfg.clone();
+      let finds = finds2.clone();
+      let gets = gets2.clone();
+      let stored = stored2.clone();
+      tokio::spawn(async move {
+        let mut options = ServerAssociationOptions::new()
+          .accept_any()
+          .ae_title("TEST-DEST")
+          .promiscuous(true)
+          .with_negotiation(AcceptStorageScp)
+          .tls_config(tls_cfg)
+          .with_transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN);
+        for uid in [
+          dicom_router::dimse::PATIENT_ROOT_FIND_SOP_CLASS_UID,
+          dicom_router::dimse::STUDY_ROOT_FIND_SOP_CLASS_UID,
+          dicom_router::dimse::PATIENT_ROOT_GET_SOP_CLASS_UID,
+          dicom_router::dimse::STUDY_ROOT_GET_SOP_CLASS_UID,
+          uids::VERIFICATION,
+          uids::CT_IMAGE_STORAGE,
+        ] {
+          options = options.with_abstract_syntax(uid);
+        }
+        let mut assoc = options.establish_tls_async(stream).await.expect("assoc");
+        let mut buf: Vec<u8> = Vec::new();
+        let mut msgid = 1u16;
+        let mut class = String::new();
+        let mut inst = String::new();
+        let mut pc_id = 0u8;
+        let mut command_field = 0u16;
+        let mut store_msgid = 1u16;
+        loop {
+          match assoc.receive().await {
+            Ok(Pdu::PData { mut data }) => {
+              for dv in &mut data {
+                if dv.value_type == PDataValueType::Command && dv.is_last {
+                  let cmd = dicom_router::dimse::decode_command(&dv.data).unwrap();
+                  command_field = dicom_router::dimse::command_field(&cmd).unwrap();
+                  pc_id = dv.presentation_context_id;
+                  if command_field == dicom_router::dimse::C_STORE_RQ {
+                    msgid = dicom_router::dimse::uint16(&cmd, dicom_router::dimse::TAG_MESSAGE_ID).unwrap();
+                    class = dicom_router::dimse::string(&cmd, dicom_router::dimse::TAG_AFFECTED_SOP_CLASS_UID)
+                      .unwrap()
+                      .to_string();
+                    inst = dicom_router::dimse::string(&cmd, dicom_router::dimse::TAG_AFFECTED_SOP_INSTANCE_UID)
+                      .unwrap()
+                      .to_string();
+                    buf.clear();
+                  } else if command_field == dicom_router::dimse::C_FIND_RQ {
+                    msgid = dicom_router::dimse::uint16(&cmd, dicom_router::dimse::TAG_MESSAGE_ID).unwrap();
+                    class = dicom_router::dimse::string(&cmd, dicom_router::dimse::TAG_AFFECTED_SOP_CLASS_UID)
+                      .unwrap()
+                      .to_string();
+                    buf.clear();
+                  } else if command_field == dicom_router::dimse::C_GET_RQ {
+                    msgid = dicom_router::dimse::uint16(&cmd, dicom_router::dimse::TAG_MESSAGE_ID).unwrap();
+                    class = dicom_router::dimse::string(&cmd, dicom_router::dimse::TAG_AFFECTED_SOP_CLASS_UID)
+                      .unwrap()
+                      .to_string();
+                    buf.clear();
+                  }
+                } else if dv.value_type == PDataValueType::Data {
+                  buf.append(&mut dv.data);
+                  if dv.is_last {
+                    match command_field {
+                      dicom_router::dimse::C_STORE_RQ => {
+                        stored.lock().unwrap().push(inst.clone());
+                        let rsp = dicom_router::dimse::create_cstore_rsp(
+                          msgid,
+                          &class,
+                          &inst,
+                          dicom_router::dimse::STATUS_SUCCESS,
+                        );
+                        assoc
+                          .send(&Pdu::PData {
+                            data: vec![PDataValue {
+                              presentation_context_id: pc_id,
+                              value_type: PDataValueType::Command,
+                              is_last: true,
+                              data: dicom_router::dimse::encode_command(&rsp),
+                            }],
+                          })
+                          .await
+                          .unwrap();
+                      }
+                      dicom_router::dimse::C_FIND_RQ => {
+                        finds.lock().unwrap().push(buf.clone());
+                        let pending_ident = encode_find_identifier("TEST", Some("1.2.840.999.1"));
+                        let pending_rsp = dicom_router::dimse::create_cfind_rsp(
+                          msgid,
+                          &class,
+                          dicom_router::dimse::STATUS_PENDING,
+                          true,
+                        );
+                        assoc
+                          .send(&Pdu::PData {
+                            data: vec![
+                              PDataValue {
+                                presentation_context_id: pc_id,
+                                value_type: PDataValueType::Command,
+                                is_last: true,
+                                data: dicom_router::dimse::encode_command(&pending_rsp),
+                              },
+                              PDataValue {
+                                presentation_context_id: pc_id,
+                                value_type: PDataValueType::Data,
+                                is_last: true,
+                                data: pending_ident,
+                              },
+                            ],
+                          })
+                          .await
+                          .unwrap();
+                        let success_rsp = dicom_router::dimse::create_cfind_rsp(
+                          msgid,
+                          &class,
+                          dicom_router::dimse::STATUS_SUCCESS,
+                          false,
+                        );
+                        assoc
+                          .send(&Pdu::PData {
+                            data: vec![PDataValue {
+                              presentation_context_id: pc_id,
+                              value_type: PDataValueType::Command,
+                              is_last: true,
+                              data: dicom_router::dimse::encode_command(&success_rsp),
+                            }],
+                          })
+                          .await
+                          .unwrap();
+                      }
+                      dicom_router::dimse::C_GET_RQ => {
+                        gets.lock().unwrap().push(buf.clone());
+                        let ct_pc = assoc
+                          .presentation_contexts()
+                          .iter()
+                          .find(|pc| pc.abstract_syntax == uids::CT_IMAGE_STORAGE)
+                          .expect("CT presentation context");
+                        let sop_instance_uid = "1.2.840.999.1";
+                        let obj = test_object(sop_instance_uid);
+                        let ts = TransferSyntaxRegistry
+                          .get(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+                          .expect("EVRLE");
+                        let mut object_data = Vec::new();
+                        obj.write_dataset_with_ts(&mut object_data, ts).expect("encode object");
+                        store_msgid = store_msgid.wrapping_add(1).max(1);
+                        let store_cmd = dicom_router::dimse::create_cstore_rq(
+                          store_msgid,
+                          uids::CT_IMAGE_STORAGE,
+                          sop_instance_uid,
+                          dicom_router::dimse::PRIORITY_MEDIUM,
+                        );
+                        assoc
+                          .send(&Pdu::PData {
+                            data: vec![
+                              PDataValue {
+                                presentation_context_id: ct_pc.id,
+                                value_type: PDataValueType::Command,
+                                is_last: true,
+                                data: dicom_router::dimse::encode_command(&store_cmd),
+                              },
+                              PDataValue {
+                                presentation_context_id: ct_pc.id,
+                                value_type: PDataValueType::Data,
+                                is_last: true,
+                                data: object_data,
+                              },
+                            ],
+                          })
+                          .await
+                          .unwrap();
+                        loop {
+                          match assoc.receive().await.unwrap() {
+                            Pdu::PData { data } => {
+                              let rsp = dicom_router::dimse::decode_command(&data[0].data).unwrap();
+                              assert_eq!(
+                                dicom_router::dimse::command_field(&rsp),
+                                Some(dicom_router::dimse::C_STORE_RSP)
+                              );
+                              break;
+                            }
+                            Pdu::ReleaseRQ => panic!("unexpected release during C-GET"),
+                            other => panic!("unexpected {other:?} during C-GET"),
+                          }
+                        }
+                        let get_rsp = dicom_router::dimse::create_cget_rsp(
+                          msgid,
+                          &class,
+                          dicom_router::dimse::STATUS_SUCCESS,
+                          0,
+                          1,
+                          0,
+                          0,
+                        );
+                        assoc
+                          .send(&Pdu::PData {
+                            data: vec![PDataValue {
+                              presentation_context_id: pc_id,
+                              value_type: PDataValueType::Command,
+                              is_last: true,
+                              data: dicom_router::dimse::encode_command(&get_rsp),
+                            }],
+                          })
+                          .await
+                          .unwrap();
+                      }
+                      _ => {}
+                    }
+                  }
+                }
+              }
+            }
+            Ok(Pdu::ReleaseRQ) => {
+              let _ = assoc.send(&Pdu::ReleaseRP).await;
+              break;
+            }
+            _ => break,
+          }
+        }
+      });
+    }
+  });
+
+  TestQrScp {
+    port,
+    finds,
+    gets,
+    stored,
+    _handle: handle,
+  }
 }
 
 /// In-process TLS C-STORE SCP that records received SOP Instance UIDs.
