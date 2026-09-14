@@ -14,8 +14,9 @@ async fn reuses_one_association_for_many_cstores() {
     ae_title:         "TEST-DEST".into(),
     host:             "127.0.0.1".into(),
     port:             dest_scp.port,
+    tls:              true,
     server_name:      Some("localhost".into()),
-    ca_cert:          pki.ca.clone(),
+    ca_cert:          Some(pki.ca.clone()),
     client_cert:      None,
     client_key:       None,
     source_ae_titles: vec![],
@@ -25,7 +26,7 @@ async fn reuses_one_association_for_many_cstores() {
     abstract_syntax: dicom_dictionary_std::uids::CT_IMAGE_STORAGE.to_string(),
     transfer_syntax: dicom_dictionary_std::uids::EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
   }];
-  let mut assoc = scu::connect(&destination, client_tls.clone(), "ROUTER", 16_384, &pcs)
+  let mut assoc = scu::connect(&destination, Some(client_tls.clone()), "ROUTER", 16_384, &pcs)
     .await
     .unwrap();
 

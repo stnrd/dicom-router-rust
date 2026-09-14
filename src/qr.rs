@@ -1,4 +1,4 @@
-//! Proxy inbound C-FIND / C-GET to one TLS destination.
+//! Proxy inbound C-FIND / C-GET to one configured destination.
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ pub const QR_SOP_CLASSES: &[&str] = &[
 #[derive(Clone)]
 pub struct QrClient {
   pub destination: Destination,
-  pub client_tls:  Arc<rustls::ClientConfig>,
+  pub client_tls:  Option<Arc<rustls::ClientConfig>>,
 }
 
 #[derive(Debug, Snafu)]
@@ -44,6 +44,13 @@ pub enum QrError {
 
 fn map_io(e: dicom_ul::association::Error) -> QrError {
   QrError::Io { source: Box::new(e) }
+}
+
+fn map_scu(e: ScuError) -> QrError {
+  match e {
+    ScuError::Io { source } => QrError::Io { source },
+    other => QrError::Outbound { source: other },
+  }
 }
 
 pub async fn proxy_find<S>(
@@ -102,10 +109,10 @@ where
       ],
     })
     .await
-    .map_err(map_io)?;
+    .map_err(map_scu)?;
 
   loop {
-    let pdu = outbound.receive().await.map_err(map_io)?;
+    let pdu = outbound.receive().await.map_err(map_scu)?;
     match pdu {
       Pdu::PData { data } => {
         let mut relayed = Vec::with_capacity(data.len());
@@ -253,12 +260,12 @@ where
       ],
     })
     .await
-    .map_err(map_io)?;
+    .map_err(map_scu)?;
 
   static STORE_MSG_ID: AtomicU16 = AtomicU16::new(100);
 
   loop {
-    let pdu = outbound.receive().await.map_err(map_io)?;
+    let pdu = outbound.receive().await.map_err(map_scu)?;
     match pdu {
       Pdu::PData { data } => {
         let cmd_dv = data
@@ -334,7 +341,7 @@ where
                       }],
                     })
                     .await
-                    .map_err(map_io)?;
+                    .map_err(map_scu)?;
                   break;
                 }
               }

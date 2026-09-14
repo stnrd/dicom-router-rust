@@ -3,9 +3,8 @@
 //! Inbound (server) TLS optionally requires mutual TLS: when a client CA bundle
 //! is supplied, [`build_server_config`] wires up a [`WebPkiClientVerifier`] so
 //! unauthenticated clients are rejected at the handshake. Outbound (client) TLS
-//! always verifies the destination's server certificate against a CA bundle and
-//! optionally presents a client certificate/key for destinations that require
-//! mTLS.
+//! verifies the destination when `destinations[].tls` is true; cleartext
+//! destinations skip this module. mTLS client certs are optional per destination.
 
 use std::fs::File;
 use std::io::BufReader;

@@ -110,7 +110,7 @@ pub const ABSTRACT_SYNTAXES: &[&str] = &[
 
 fn server_options(
   cfg: &Config,
-  tls: Arc<rustls::ServerConfig>,
+  tls: Option<Arc<rustls::ServerConfig>>,
   qr: Option<&QrClient>,
 ) -> ServerAssociationOptions<'static, AcceptAny, EchoRoles> {
   let mut options = ServerAssociationOptions::new()
@@ -118,8 +118,10 @@ fn server_options(
     .ae_title(cfg.ae_title.clone())
     .max_pdu_length(cfg.max_pdu_length)
     .promiscuous(cfg.promiscuous)
-    .with_negotiation(EchoRoles)
-    .tls_config(tls);
+    .with_negotiation(EchoRoles);
+  if let Some(tls_cfg) = tls {
+    options = options.tls_config(tls_cfg);
+  }
   for ts in TransferSyntaxRegistry.iter() {
     if !ts.is_unsupported() {
       options = options.with_transfer_syntax(ts.uid());
@@ -139,17 +141,19 @@ fn server_options(
 /// Bind the listener and spawn the accept loop.
 pub async fn spawn(
   cfg: Arc<Config>,
-  tls: Arc<rustls::ServerConfig>,
+  tls: Option<Arc<rustls::ServerConfig>>,
   log: Logger,
   shutdown: CancellationToken,
   qr: Option<QrClient>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
   let listener = TcpListener::bind(&cfg.listen_addr).await?;
+  let inbound_tls = tls.is_some();
   info!(
       log,
-      "listening for DICOM TLS associations";
+      "listening for DICOM associations";
       "listen_addr" => &cfg.listen_addr,
-      "ae_title" => &cfg.ae_title
+      "ae_title" => &cfg.ae_title,
+      "tls" => inbound_tls
   );
   let options = server_options(&cfg, tls, qr.as_ref());
   let conn_sem = Arc::new(Semaphore::new(cfg.max_concurrent_associations));
@@ -182,7 +186,8 @@ pub async fn spawn(
               let qr = qr.clone();
               connections.spawn(async move {
                   let _permit = permit;
-                  match options.establish_tls_async(stream).await {
+                  if inbound_tls {
+                    match options.establish_tls_async(stream).await {
                       Ok(association) => {
                           let peer_ae = association.peer_ae_title().to_string();
                           let alog = conn_log.new(o!("calling_ae" => peer_ae.clone()));
@@ -200,9 +205,29 @@ pub async fn spawn(
                           }
                           info!(alog, "association closed");
                       }
-                      Err(e) => {
-                          debug!(conn_log, "association rejected"; "error" => %e);
+                      Err(e) => debug!(conn_log, "association rejected"; "error" => %e),
+                    }
+                  } else {
+                    match options.establish_async(stream).await {
+                      Ok(association) => {
+                          let peer_ae = association.peer_ae_title().to_string();
+                          let alog = conn_log.new(o!("calling_ae" => peer_ae.clone()));
+                          info!(
+                              alog,
+                              "association established";
+                              "accepted_presentation_contexts" => association
+                                  .presentation_contexts()
+                                  .iter()
+                                  .filter(|pc| pc.reason == PresentationContextResultReason::Acceptance)
+                                  .count() as u64
+                          );
+                          if let Err(e) = handle_association(association, &cfg, qr, alog.clone()).await {
+                              warn!(alog, "association ended with error"; "error" => %e);
+                          }
+                          info!(alog, "association closed");
                       }
+                      Err(e) => debug!(conn_log, "association rejected"; "error" => %e),
+                    }
                   }
               });
           }

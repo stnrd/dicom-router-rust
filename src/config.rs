@@ -38,7 +38,7 @@ pub struct Config {
   pub min_free_bytes:              u64,
   #[serde(default)]
   pub retry:                       RetryConfig,
-  /// Inbound TLS (server) settings.
+  /// Inbound TLS settings. When `tls.enabled` is false, associations are plain DICOM.
   pub tls:                         ServerTls,
   /// Forwarding destinations (at least one).
   pub destinations:                Vec<Destination>,
@@ -50,10 +50,15 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerTls {
-  /// PEM certificate chain presented to inbound clients.
-  pub server_cert: PathBuf,
-  /// PEM private key for the server certificate.
-  pub server_key:  PathBuf,
+  /// When false, inbound associations use cleartext DICOM (typical port 104).
+  #[serde(default = "default_true")]
+  pub enabled:     bool,
+  /// PEM certificate chain presented to inbound clients (required when `enabled`).
+  #[serde(default)]
+  pub server_cert: Option<PathBuf>,
+  /// PEM private key for the server certificate (required when `enabled`).
+  #[serde(default)]
+  pub server_key:  Option<PathBuf>,
   /// Optional CA bundle: when set, inbound clients MUST present a client
   /// certificate signed by one of these CAs (mutual TLS).
   pub client_ca:   Option<PathBuf>,
@@ -67,13 +72,16 @@ pub struct Destination {
   pub ae_title:         String,
   /// Destination host (DNS name or IP).
   pub host:             String,
-  /// Destination port (DICOM over TLS, typically 2762).
+  /// Destination port (2762 for DICOM TLS, 104 for cleartext).
   pub port:             u16,
+  /// When false, outbound associations use cleartext DICOM.
+  #[serde(default = "default_true")]
+  pub tls:              bool,
   /// TLS server name (SNI / certificate verification). Defaults to `host`.
   pub server_name:      Option<String>,
-  /// PEM CA bundle used to verify the destination's certificate. Required:
-  /// outbound traffic is always TLS and always verified.
-  pub ca_cert:          PathBuf,
+  /// PEM CA bundle used to verify the destination's certificate (required when `tls`).
+  #[serde(default)]
+  pub ca_cert:          Option<PathBuf>,
   /// Optional client certificate/key for destinations requiring mTLS.
   pub client_cert:      Option<PathBuf>,
   pub client_key:       Option<PathBuf>,
@@ -112,6 +120,7 @@ impl Default for RetryConfig {
   }
 }
 
+fn default_true() -> bool { true }
 fn default_max_pdu_length() -> u32 { 131_072 }
 fn default_dead_letter_dir() -> PathBuf { PathBuf::from("/var/lib/dicom-router/dead-letter") }
 fn default_max_concurrent_associations() -> usize { 32 }
@@ -152,6 +161,16 @@ impl Config {
     if self.destinations.is_empty() {
       return Err(invalid("at least one destination is required".into()));
     }
+    if self.tls.enabled {
+      if self.tls.server_cert.is_none() {
+        return Err(invalid("tls.server_cert is required when tls.enabled is true".into()));
+      }
+      if self.tls.server_key.is_none() {
+        return Err(invalid("tls.server_key is required when tls.enabled is true".into()));
+      }
+    } else if self.tls.client_ca.is_some() {
+      return Err(invalid("tls.client_ca requires tls.enabled to be true".into()));
+    }
     let mut names = HashSet::new();
     for d in &self.destinations {
       if !names.insert(d.name.clone()) {
@@ -160,6 +179,18 @@ impl Config {
       if d.ae_title.is_empty() || d.ae_title.len() > 16 {
         return Err(invalid(format!(
           "destination {:?}: ae_title must be 1..=16 chars",
+          d.name
+        )));
+      }
+      if d.tls && d.ca_cert.is_none() {
+        return Err(invalid(format!(
+          "destination {:?}: ca_cert is required when tls is true",
+          d.name
+        )));
+      }
+      if !d.tls && (d.client_cert.is_some() || d.client_key.is_some()) {
+        return Err(invalid(format!(
+          "destination {:?}: client_cert/client_key require tls: true",
           d.name
         )));
       }
@@ -415,5 +446,47 @@ destinations: []
     let cfg: Config = serde_yaml::from_str(VALID_YAML).unwrap();
     cfg.validate().unwrap();
     assert!(cfg.qr_destination().is_none());
+  }
+
+  #[test]
+  fn inbound_cleartext_requires_no_server_cert() {
+    let yaml = r#"
+listen_addr: "127.0.0.1:11104"
+ae_title: "ROUTER"
+queue_dir: "/tmp/q"
+tls:
+  enabled: false
+destinations:
+  - name: orthanc
+    ae_title: "ORTHANC"
+    host: 127.0.0.1
+    port: 4242
+    tls: false
+"#;
+    let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+    cfg.validate().unwrap();
+    assert!(!cfg.tls.enabled);
+    assert!(!cfg.destinations[0].tls);
+  }
+
+  #[test]
+  fn cleartext_destination_rejects_client_cert() {
+    let yaml = r#"
+listen_addr: "127.0.0.1:11104"
+ae_title: "ROUTER"
+queue_dir: "/tmp/q"
+tls:
+  enabled: false
+destinations:
+  - name: orthanc
+    ae_title: "ORTHANC"
+    host: 127.0.0.1
+    port: 4242
+    tls: false
+    client_cert: "tests/certs/client.crt"
+    client_key: "tests/certs/client.key"
+"#;
+    let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+    assert!(cfg.validate().is_err());
   }
 }

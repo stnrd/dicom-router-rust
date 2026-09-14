@@ -52,9 +52,9 @@ query_retrieve:
   let client_tls = tls::build_client_config(&pki.ca, None, None).unwrap();
   let qr = Some(dicom_router::qr::QrClient {
     destination: cfg.destinations[0].clone(),
-    client_tls:  client_tls.clone(),
+    client_tls:  Some(client_tls.clone()),
   });
-  let _scp = scp::spawn(cfg.clone(), server_tls, log, token.clone(), qr)
+  let _scp = scp::spawn(cfg.clone(), Some(server_tls), log, token.clone(), qr)
     .await
     .unwrap();
 

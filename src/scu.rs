@@ -1,4 +1,4 @@
-//! Outbound DICOM Service Class User: forwards spooled objects over TLS.
+//! Outbound DICOM Service Class User: forwards spooled objects to destinations.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,7 @@ use dicom_encoding::TransferSyntaxIndex;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use dicom_ul::association::client::{AsyncTlsStream, ClientAssociationOptions};
 use dicom_ul::association::AsyncClientAssociation;
+use dicom_ul::pdu::PresentationContextNegotiated;
 use dicom_ul::pdu::{PDataValue, PDataValueType};
 use dicom_ul::Pdu;
 use slog::{debug, info, warn, Logger};
@@ -29,6 +30,43 @@ pub struct RoleSelection {
   pub sop_class: String,
   pub scu:       bool,
   pub scp:       bool,
+}
+
+/// Outbound association over TLS or cleartext TCP, depending on destination config.
+pub enum ClientAssoc {
+  Tls(AsyncClientAssociation<AsyncTlsStream>),
+  Plain(AsyncClientAssociation<tokio::net::TcpStream>),
+}
+
+impl ClientAssoc {
+  pub fn presentation_contexts(&self) -> &[PresentationContextNegotiated] {
+    match self {
+      Self::Tls(a) => a.presentation_contexts(),
+      Self::Plain(a) => a.presentation_contexts(),
+    }
+  }
+
+  pub fn acceptor_max_pdu_length(&self) -> u32 {
+    match self {
+      Self::Tls(a) => a.acceptor_max_pdu_length(),
+      Self::Plain(a) => a.acceptor_max_pdu_length(),
+    }
+  }
+
+  pub async fn send(&mut self, pdu: &Pdu) -> Result<(), ScuError> {
+    match self {
+      Self::Tls(a) => a.send(pdu).await.map_err(|e| ScuError::Io { source: Box::new(e) }),
+      Self::Plain(a) => a.send(pdu).await.map_err(|e| ScuError::Io { source: Box::new(e) }),
+    }
+  }
+
+  pub async fn receive(&mut self) -> Result<Pdu, ScuError> {
+    match self {
+      Self::Tls(a) => a.receive().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
+      Self::Plain(a) => a.receive().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
+    }
+  }
+
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +106,8 @@ pub enum ScuError {
   },
   #[snafu(display("outbound session unavailable: {reason}"))]
   SessionUnavailable { reason: String },
+  #[snafu(display("destination {:?} requires TLS but no client TLS config was provided", destination))]
+  MissingClientTls { destination: String },
 }
 
 pub fn read_spooled_meta(path: &Path) -> Result<SpooledMeta, ScuError> {
@@ -96,14 +136,14 @@ pub fn presentation_keys_for_meta(meta: &SpooledMeta) -> Vec<PresentationKey> {
   }]
 }
 
-/// Open a TLS association with the given presentation contexts.
+/// Open an association with the given presentation contexts.
 pub async fn connect(
   destination: &Destination,
-  client_tls: Arc<rustls::ClientConfig>,
+  client_tls: Option<Arc<rustls::ClientConfig>>,
   calling_ae_title: &str,
   max_pdu_length: u32,
   pcs: &[PresentationKey],
-) -> Result<AsyncClientAssociation<AsyncTlsStream>, ScuError> {
+) -> Result<ClientAssoc, ScuError> {
   connect_with_roles(
     destination,
     client_tls,
@@ -117,24 +157,18 @@ pub async fn connect(
 
 pub async fn connect_with_roles(
   destination: &Destination,
-  client_tls: Arc<rustls::ClientConfig>,
+  client_tls: Option<Arc<rustls::ClientConfig>>,
   calling_ae_title: &str,
   max_pdu_length: u32,
   pcs: &[PresentationKey],
   roles: &[RoleSelection],
-) -> Result<AsyncClientAssociation<AsyncTlsStream>, ScuError> {
+) -> Result<ClientAssoc, ScuError> {
   let ae_address = format!("{}@{}:{}", destination.ae_title, destination.host, destination.port);
-  let server_name = destination
-    .server_name
-    .clone()
-    .unwrap_or_else(|| destination.host.clone());
 
   let mut options = ClientAssociationOptions::new()
     .calling_ae_title(calling_ae_title.to_string())
     .called_ae_title(destination.ae_title.clone())
-    .max_pdu_length(max_pdu_length)
-    .tls_config(client_tls)
-    .server_name(&server_name);
+    .max_pdu_length(max_pdu_length);
 
   for pc in pcs {
     options = options.with_presentation_context(pc.abstract_syntax.clone(), vec![pc.transfer_syntax.clone()]);
@@ -143,26 +177,46 @@ pub async fn connect_with_roles(
     options = options.with_role_selection(role.sop_class.clone(), role.scu, role.scp);
   }
 
-  options
-    .establish_with_async_tls(&ae_address)
-    .await
-    .map_err(|e| ScuError::Association {
-      ae_address: ae_address.clone(),
-      source:     Box::new(e),
-    })
+  if destination.tls {
+    let tls_cfg = client_tls.ok_or_else(|| ScuError::MissingClientTls {
+      destination: destination.name.clone(),
+    })?;
+    let server_name = destination
+      .server_name
+      .clone()
+      .unwrap_or_else(|| destination.host.clone());
+    options = options.tls_config(tls_cfg).server_name(&server_name);
+    options
+      .establish_with_async_tls(&ae_address)
+      .await
+      .map_err(|e| ScuError::Association {
+        ae_address: ae_address.clone(),
+        source:     Box::new(e),
+      })
+      .map(ClientAssoc::Tls)
+  } else {
+    options
+      .establish_with_async(&ae_address)
+      .await
+      .map_err(|e| ScuError::Association {
+        ae_address: ae_address.clone(),
+        source:     Box::new(e),
+      })
+      .map(ClientAssoc::Plain)
+  }
 }
 
-pub async fn release<S>(assoc: AsyncClientAssociation<S>) -> Result<(), ScuError>
-where
-  S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-{
-  assoc.release().await.map_err(|e| ScuError::Io { source: Box::new(e) })
+pub async fn release(assoc: ClientAssoc) -> Result<(), ScuError> {
+  match assoc {
+    ClientAssoc::Tls(a) => a.release().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
+    ClientAssoc::Plain(a) => a.release().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
+  }
 }
 
-/// Forward one spooled object over a fresh TLS association (tests / fallback).
+/// Forward one spooled object over a fresh association (tests / fallback).
 pub async fn forward(
   destination: &Destination,
-  client_tls: Arc<rustls::ClientConfig>,
+  client_tls: Option<Arc<rustls::ClientConfig>>,
   spooled: &SpooledObject,
   calling_ae_title: &str,
   max_pdu_length: u32,
@@ -189,15 +243,12 @@ pub async fn forward(
   Ok(())
 }
 
-pub async fn send_object<S>(
-  assoc: &mut AsyncClientAssociation<S>,
+pub async fn send_object(
+  assoc: &mut ClientAssoc,
   file: &dicom_object::FileDicomObject<dicom_object::InMemDicomObject>,
   meta: &SpooledMeta,
   log: &Logger,
-) -> Result<(), ScuError>
-where
-  S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-{
+) -> Result<(), ScuError> {
   let sop_class_uid = &meta.sop_class_uid;
   let sop_instance_uid = &meta.sop_instance_uid;
   let transfer_syntax = &meta.transfer_syntax;
@@ -229,7 +280,6 @@ where
     .write_dataset_with_ts(&mut object_data, ts)
     .map_err(|e| ScuError::Encode { source: Box::new(e) })?;
 
-  let map_io = |e: dicom_ul::association::Error| ScuError::Io { source: Box::new(e) };
   if cmd_data.len() + object_data.len() < assoc.acceptor_max_pdu_length().saturating_sub(100) as usize {
     assoc
       .send(&Pdu::PData {
@@ -248,8 +298,7 @@ where
           },
         ],
       })
-      .await
-      .map_err(map_io)?;
+      .await?;
   } else {
     assoc
       .send(&Pdu::PData {
@@ -260,16 +309,24 @@ where
           data:                    cmd_data,
         }],
       })
-      .await
-      .map_err(map_io)?;
-    let mut pdata = assoc.send_pdata(pc.id);
-    pdata
-      .write_all(&object_data)
-      .await
-      .map_err(|e| ScuError::WritePData { source: e })?;
+      .await?;
+    match assoc {
+      ClientAssoc::Tls(a) => {
+        a.send_pdata(pc.id)
+          .write_all(&object_data)
+          .await
+          .map_err(|e| ScuError::WritePData { source: e })?;
+      }
+      ClientAssoc::Plain(a) => {
+        a.send_pdata(pc.id)
+          .write_all(&object_data)
+          .await
+          .map_err(|e| ScuError::WritePData { source: e })?;
+      }
+    }
   }
 
-  let rsp_pdu = assoc.receive().await.map_err(map_io)?;
+  let rsp_pdu = assoc.receive().await?;
   match rsp_pdu {
     Pdu::PData { data } => {
       let cmd_obj = dimse::decode_command(&data[0].data).map_err(|_| ScuError::StoreRefused {

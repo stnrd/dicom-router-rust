@@ -1,11 +1,10 @@
-//! Per-destination outbound session: one reused TLS association, many C-STOREs.
+//! Per-destination outbound session: one reused association, many C-STOREs.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dicom_ul::association::client::AsyncTlsStream;
-use dicom_ul::association::AsyncClientAssociation;
+use crate::scu::ClientAssoc;
 use slog::{error, info, o, warn, Logger};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -19,7 +18,7 @@ const JOB_CHANNEL_SIZE: usize = 64;
 
 pub struct OutboundSessionConfig {
   pub destination:      Destination,
-  pub client_tls:       Arc<rustls::ClientConfig>,
+  pub client_tls:       Option<Arc<rustls::ClientConfig>>,
   pub calling_ae_title: String,
   pub max_pdu_length:   u32,
   pub log:              Logger,
@@ -32,7 +31,7 @@ struct SessionJob {
 }
 
 struct SessionState {
-  assoc:      Option<AsyncClientAssociation<AsyncTlsStream>>,
+  assoc:      Option<ClientAssoc>,
   negotiated: HashSet<(String, String)>,
 }
 
@@ -198,7 +197,7 @@ async fn reconnect(
   disconnect(session, log).await;
   let assoc = scu::connect(
     &config.destination,
-    config.client_tls.clone(),
+    config.client_tls.as_ref().cloned(),
     &config.calling_ae_title,
     config.max_pdu_length,
     &pcs,
