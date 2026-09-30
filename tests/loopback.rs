@@ -49,7 +49,7 @@ destinations:
   let token = CancellationToken::new();
   let log = slog::Logger::root(slog::Discard, slog::o!());
   let server_tls = tls::build_server_config(&pki.server_cert, &pki.server_key, None).unwrap();
-  let _scp = scp::spawn(cfg.clone(), Some(server_tls), log.clone(), token.clone())
+  let _scp = scp::spawn(cfg.clone(), Some(server_tls), log.clone(), token.clone(), None)
     .await
     .unwrap();
   let client_tls = tls::build_client_config(&pki.ca, None, None).unwrap();

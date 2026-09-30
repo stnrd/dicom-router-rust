@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use dicom_core::{dicom_value, DataElement, VR};
 use dicom_dictionary_std::{tags, uids};
+use dicom_encoding::TransferSyntaxIndex;
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
+use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 
 /// Build a minimal CT image for queue/forward tests.
@@ -38,6 +40,248 @@ pub fn test_object(sop_instance_uid: &str) -> dicom_object::FileDicomObject<InMe
     .build()
     .unwrap();
   obj.with_exact_meta(meta)
+}
+
+pub fn encode_dataset(obj: &InMemDicomObject, ts_uid: &str) -> Vec<u8> {
+  let ts = TransferSyntaxRegistry.get(ts_uid).expect("known transfer syntax");
+  let mut buf = Vec::new();
+  obj.write_dataset_with_ts(&mut buf, ts).expect("encode dataset");
+  buf
+}
+
+pub fn decode_dataset(bytes: &[u8], ts_uid: &str) -> InMemDicomObject {
+  let ts = TransferSyntaxRegistry.get(ts_uid).expect("known transfer syntax");
+  InMemDicomObject::read_dataset_with_ts(bytes, ts).expect("decode dataset")
+}
+
+pub fn element_str(obj: &InMemDicomObject, tag: dicom_core::Tag) -> String {
+  obj
+    .element(tag)
+    .unwrap()
+    .to_str()
+    .unwrap()
+    .trim_end_matches(['\0', ' '])
+    .to_string()
+}
+
+pub fn find_identifier(patient_id: &str) -> InMemDicomObject {
+  let mut obj = InMemDicomObject::new_empty();
+  obj.put(DataElement::new(
+    tags::QUERY_RETRIEVE_LEVEL,
+    VR::CS,
+    dicom_value!(Str, "STUDY"),
+  ));
+  obj.put(DataElement::new(
+    tags::PATIENT_ID,
+    VR::LO,
+    dicom_value!(Str, patient_id),
+  ));
+  obj.put(DataElement::new(
+    tags::STUDY_INSTANCE_UID,
+    VR::UI,
+    dicom_value!(Str, ""),
+  ));
+  obj
+}
+
+/// 512x512 16-bit CT image (512 KiB of pixel data): larger than any default
+/// max PDU, so it always travels in several P-DATA fragments.
+pub fn large_ct_image(sop_instance_uid: &str) -> InMemDicomObject {
+  let mut obj = InMemDicomObject::new_empty();
+  obj.put(DataElement::new(
+    tags::SOP_CLASS_UID,
+    VR::UI,
+    dicom_value!(Str, uids::CT_IMAGE_STORAGE),
+  ));
+  obj.put(DataElement::new(
+    tags::SOP_INSTANCE_UID,
+    VR::UI,
+    dicom_value!(Str, sop_instance_uid),
+  ));
+  obj.put(DataElement::new(tags::ROWS, VR::US, dicom_value!(U16, [512])));
+  obj.put(DataElement::new(tags::COLUMNS, VR::US, dicom_value!(U16, [512])));
+  obj.put(DataElement::new(tags::BITS_ALLOCATED, VR::US, dicom_value!(U16, [16])));
+  let pixels: Vec<u16> = (0..512u32 * 512).map(|i| (i * 7 % 4096) as u16).collect();
+  obj.put(DataElement::new(
+    tags::PIXEL_DATA,
+    VR::OW,
+    dicom_core::PrimitiveValue::U16(pixels.into()),
+  ));
+  obj
+}
+
+pub const STATUS_CANCEL: u16 = 0xFE00;
+pub const QR_STUB_INSTANCE: &str = "1.2.840.999.1";
+
+struct AcceptStorageScp;
+
+impl dicom_ul::association::server::Negotiation for AcceptStorageScp {
+  fn negotiate_roles(
+    &self,
+    _sop_class_uid: &str,
+    scu_role: bool,
+    scp_role: bool,
+  ) -> Option<dicom_ul::pdu::RequestorRoles> {
+    Some(dicom_ul::pdu::RequestorRoles {
+      scu: scu_role,
+      scp: scp_role,
+    })
+  }
+}
+
+/// A query the stub received: transfer syntax of its presentation context
+/// plus the identifier bytes.
+pub type ReceivedQuery = (String, Vec<u8>);
+
+/// In-process TLS C-FIND/C-GET SCP standing in for a PACS.
+///
+/// Behaves like a real archive on the wire: commands and datasets go out as
+/// separate PDUs and datasets are fragmented to the peer's max PDU length.
+/// The query's PatientID selects the scenario:
+/// - `ABORT`: abort the association instead of answering
+/// - `CANCEL`: one pending response, then wait for C-CANCEL-RQ and answer with
+///   status Cancel
+/// - anything else: C-FIND gets one pending match plus success; C-GET sends
+///   [`large_ct_image`] as a C-STORE sub-operation, then success
+pub struct TestQrScp {
+  pub port:    u16,
+  pub finds:   Arc<Mutex<Vec<ReceivedQuery>>>,
+  pub gets:    Arc<Mutex<Vec<ReceivedQuery>>>,
+  pub cancels: Arc<Mutex<u32>>,
+  _handle:     tokio::task::JoinHandle<()>,
+}
+
+pub async fn start_test_qr_scp(server_cert: &Path, server_key: &Path, transfer_syntaxes: &[&'static str]) -> TestQrScp {
+  use dicom_router::dimse;
+  use dicom_router::qr::{send_message, MessageReader};
+  use dicom_ul::association::server::ServerAssociationOptions;
+
+  let tls_cfg = dicom_router::tls::build_server_config(server_cert, server_key, None).expect("test QR SCP TLS config");
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    .await
+    .expect("bind test QR SCP");
+  let port = listener.local_addr().unwrap().port();
+  let finds = Arc::new(Mutex::new(Vec::new()));
+  let gets = Arc::new(Mutex::new(Vec::new()));
+  let cancels = Arc::new(Mutex::new(0));
+  let transfer_syntaxes = transfer_syntaxes.to_vec();
+  let (finds2, gets2, cancels2) = (finds.clone(), gets.clone(), cancels.clone());
+
+  let handle = tokio::spawn(async move {
+    loop {
+      let (stream, _) = listener.accept().await.expect("accept");
+      let mut options = ServerAssociationOptions::new()
+        .accept_any()
+        .ae_title("TEST-DEST")
+        .promiscuous(true)
+        .with_negotiation(AcceptStorageScp)
+        .tls_config(tls_cfg.clone());
+      for ts in &transfer_syntaxes {
+        options = options.with_transfer_syntax(*ts);
+      }
+      for uid in dicom_router::qr::QR_SOP_CLASSES.iter().chain(&[uids::CT_IMAGE_STORAGE]) {
+        options = options.with_abstract_syntax(*uid);
+      }
+      let (finds, gets, cancels) = (finds2.clone(), gets2.clone(), cancels2.clone());
+      tokio::spawn(async move {
+        let Ok(mut assoc) = options.establish_tls_async(stream).await else {
+          return;
+        };
+        let mut reader = MessageReader::default();
+        let Ok(request) = reader.read(&mut assoc).await else {
+          return;
+        };
+        let pc = assoc
+          .presentation_contexts()
+          .iter()
+          .find(|pc| pc.id == request.pc_id)
+          .unwrap()
+          .clone();
+        let msgid = dimse::uint16(&request.command, dimse::TAG_MESSAGE_ID).unwrap();
+        let identifier = request.dataset.unwrap();
+        let patient_id = element_str(&decode_dataset(&identifier, &pc.transfer_syntax), tags::PATIENT_ID);
+        let field = dimse::command_field(&request.command).unwrap();
+        let query = (pc.transfer_syntax.clone(), identifier);
+        if field == dimse::C_FIND_RQ {
+          finds.lock().unwrap().push(query);
+        } else {
+          gets.lock().unwrap().push(query);
+        }
+
+        if patient_id == "ABORT" {
+          let _ = assoc.abort().await;
+          return;
+        }
+        if field == dimse::C_FIND_RQ {
+          let mut matched = find_identifier(&patient_id);
+          matched.put(DataElement::new(
+            tags::STUDY_INSTANCE_UID,
+            VR::UI,
+            dicom_value!(Str, QR_STUB_INSTANCE),
+          ));
+          let pending = dimse::create_cfind_rsp(msgid, &pc.abstract_syntax, dimse::STATUS_PENDING, true);
+          let data = encode_dataset(&matched, &pc.transfer_syntax);
+          send_message(&mut assoc, pc.id, &pending, Some(&data)).await.unwrap();
+          let status = if patient_id == "CANCEL" {
+            let cancel = reader.read(&mut assoc).await.unwrap();
+            assert_eq!(dimse::command_field(&cancel.command), Some(dimse::C_CANCEL_RQ));
+            assert_eq!(
+              dimse::uint16(&cancel.command, dimse::TAG_MESSAGE_ID_BEING_RESPONDED_TO),
+              Some(msgid)
+            );
+            *cancels.lock().unwrap() += 1;
+            STATUS_CANCEL
+          } else {
+            dimse::STATUS_SUCCESS
+          };
+          let last = dimse::create_cfind_rsp(msgid, &pc.abstract_syntax, status, false);
+          send_message(&mut assoc, pc.id, &last, None).await.unwrap();
+        } else {
+          let ct_pc = assoc
+            .presentation_contexts()
+            .iter()
+            .find(|p| {
+              p.abstract_syntax == uids::CT_IMAGE_STORAGE
+                && p.reason == dicom_ul::pdu::PresentationContextResultReason::Acceptance
+            })
+            .expect("CT storage context")
+            .clone();
+          let store = dimse::create_cstore_rq(41, uids::CT_IMAGE_STORAGE, QR_STUB_INSTANCE, dimse::PRIORITY_MEDIUM);
+          let image = encode_dataset(&large_ct_image(QR_STUB_INSTANCE), &ct_pc.transfer_syntax);
+          send_message(&mut assoc, ct_pc.id, &store, Some(&image)).await.unwrap();
+          let rsp = reader.read(&mut assoc).await.unwrap();
+          assert_eq!(dimse::command_field(&rsp.command), Some(dimse::C_STORE_RSP));
+          assert_eq!(
+            dimse::uint16(&rsp.command, dimse::TAG_MESSAGE_ID_BEING_RESPONDED_TO),
+            Some(41)
+          );
+          let ok = dimse::uint16(&rsp.command, dimse::TAG_STATUS) == Some(dimse::STATUS_SUCCESS);
+          let (completed, failed) = if ok { (1, 0) } else { (0, 1) };
+          let last = dimse::create_cget_rsp(
+            msgid,
+            &pc.abstract_syntax,
+            dimse::STATUS_SUCCESS,
+            0,
+            completed,
+            failed,
+            0,
+          );
+          send_message(&mut assoc, pc.id, &last, None).await.unwrap();
+        }
+        if let Ok(dicom_ul::Pdu::ReleaseRQ) = assoc.receive().await {
+          let _ = assoc.send(&dicom_ul::Pdu::ReleaseRP).await;
+        }
+      });
+    }
+  });
+
+  TestQrScp {
+    port,
+    finds,
+    gets,
+    cancels,
+    _handle: handle,
+  }
 }
 
 /// In-process TLS C-STORE SCP that records received SOP Instance UIDs.
