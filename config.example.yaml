@@ -38,6 +38,7 @@ destinations:
     tls: true
     ca_cert: "/etc/dicom-router/tls/pacs-ca.crt"
     # source_ae_titles: ["CT_SCANNER_1"]  # optional filter by calling AE
+    # compression: jpeg-xl-lossless  # none (default) | jpeg-xl-lossless | explicit-le
 
   # Example cleartext destination (e.g. local Orthanc on 4242):
   # - name: orthanc

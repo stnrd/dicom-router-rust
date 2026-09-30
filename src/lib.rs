@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod compression;
 pub mod config;
 pub mod dimse;
 pub mod dispatcher;

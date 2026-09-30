@@ -40,15 +40,63 @@ pub fn test_object(sop_instance_uid: &str) -> dicom_object::FileDicomObject<InMe
   obj.with_exact_meta(meta)
 }
 
+/// Build a 16-bit monochrome CT image with smooth, compressible pixel data.
+pub fn test_image(sop_instance_uid: &str) -> dicom_object::FileDicomObject<InMemDicomObject> {
+  let (rows, cols) = (128u16, 128u16);
+  let pixels: Vec<u16> = (0..rows as u32 * cols as u32)
+    .map(|i| {
+      let (y, x) = (i / cols as u32, i % cols as u32);
+      (1000 + (x * 3 + y * 2) + ((x ^ y) & 7)) as u16
+    })
+    .collect();
+  let mut file = test_object(sop_instance_uid);
+  for (tag, value) in [
+    (tags::ROWS, rows),
+    (tags::COLUMNS, cols),
+    (tags::SAMPLES_PER_PIXEL, 1),
+    (tags::BITS_ALLOCATED, 16),
+    (tags::BITS_STORED, 12),
+    (tags::HIGH_BIT, 11),
+    (tags::PIXEL_REPRESENTATION, 0),
+  ] {
+    file.put(DataElement::new(tag, VR::US, dicom_value!(U16, [value])));
+  }
+  file.put(DataElement::new(
+    tags::PHOTOMETRIC_INTERPRETATION,
+    VR::CS,
+    dicom_value!(Str, "MONOCHROME2"),
+  ));
+  file.put(DataElement::new(
+    tags::PIXEL_DATA,
+    VR::OW,
+    dicom_core::PrimitiveValue::U16(pixels.into()),
+  ));
+  file
+}
+
+/// (transfer syntax UID, encoded dataset) of a stored object.
+pub type ReceivedObject = (String, Vec<u8>);
+
 /// In-process TLS C-STORE SCP that records received SOP Instance UIDs.
 pub struct TestScp {
   pub port:              u16,
   pub received:          Arc<Mutex<Vec<String>>>,
+  pub objects:           Arc<Mutex<Vec<ReceivedObject>>>,
   pub association_count: Arc<std::sync::atomic::AtomicU32>,
   _handle:               tokio::task::JoinHandle<()>,
 }
 
 pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
+  start_test_scp_with_ts(server_cert, server_key, &[]).await
+}
+
+/// Like [`start_test_scp`], but only accepts the given transfer syntaxes
+/// (empty = every supported one).
+pub async fn start_test_scp_with_ts(
+  server_cert: &Path,
+  server_key: &Path,
+  transfer_syntaxes: &[&'static str],
+) -> TestScp {
   use dicom_ul::association::server::ServerAssociationOptions;
   use dicom_ul::pdu::{PDataValue, PDataValueType};
   use dicom_ul::Pdu;
@@ -60,6 +108,9 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
   let port = listener.local_addr().unwrap().port();
   let received = Arc::new(Mutex::new(Vec::new()));
   let received2 = received.clone();
+  let objects = Arc::new(Mutex::new(Vec::new()));
+  let objects2 = objects.clone();
+  let transfer_syntaxes = transfer_syntaxes.to_vec();
   let association_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
   let association_count2 = association_count.clone();
 
@@ -68,13 +119,18 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
       let (stream, _) = listener.accept().await.expect("accept");
       let tls_cfg = tls_cfg.clone();
       let received = received2.clone();
+      let objects = objects2.clone();
+      let transfer_syntaxes = transfer_syntaxes.clone();
       let association_count = association_count2.clone();
       tokio::spawn(async move {
-        let options = ServerAssociationOptions::new()
+        let mut options = ServerAssociationOptions::new()
           .accept_any()
           .ae_title("TEST-DEST")
           .promiscuous(true)
           .tls_config(tls_cfg);
+        for ts in transfer_syntaxes {
+          options = options.with_transfer_syntax(ts);
+        }
         let mut assoc = options.establish_tls_async(stream).await.expect("assoc");
         association_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut buf: Vec<u8> = Vec::new();
@@ -101,6 +157,13 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
                   buf.append(&mut dv.data);
                   if dv.is_last {
                     received.lock().unwrap().push(inst.clone());
+                    let ts = assoc
+                      .presentation_contexts()
+                      .iter()
+                      .find(|pc| pc.id == dv.presentation_context_id)
+                      .map(|pc| pc.transfer_syntax.clone())
+                      .unwrap_or_default();
+                    objects.lock().unwrap().push((ts, std::mem::take(&mut buf)));
                     let rsp =
                       dicom_router::dimse::create_cstore_rsp(msgid, &class, &inst, dicom_router::dimse::STATUS_SUCCESS);
                     let data = dicom_router::dimse::encode_command(&rsp);
@@ -132,6 +195,7 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
   TestScp {
     port,
     received,
+    objects,
     association_count,
     _handle: handle,
   }
@@ -220,6 +284,8 @@ pub async fn start_test_scp_plain() -> TestScp {
   TestScp {
     port,
     received,
+    // Cleartext tests only check SOP Instance UIDs.
+    objects: Arc::new(Mutex::new(Vec::new())),
     association_count,
     _handle: handle,
   }

@@ -20,7 +20,9 @@ dicom-core = "0.10"
 dicom-dictionary-std = "0.10"
 dicom-object = "0.10"
 dicom-encoding = "0.10"
-dicom-transfer-syntax-registry = "0.10"
+dicom-transfer-syntax-registry = { version = "0.10", features = ["jpegxl"] }
+# Pixel data transcoding for outbound compression (pure Rust codecs only)
+dicom-pixeldata = { version = "0.10", default-features = false, features = ["native", "jpegxl"] }
 dicom-ul = { version = "0.10", features = ["async-tls"] }
 
 # Async runtime

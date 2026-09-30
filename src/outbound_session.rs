@@ -107,21 +107,19 @@ async fn process_job(
   session: &mut SessionState,
   spooled: SpooledObject,
 ) -> Result<(), ScuError> {
-  let meta = scu::read_spooled_meta(&spooled.dcm_path)?;
-  ensure_connected(config, log, session, &meta).await?;
-
-  let file = dicom_object::open_file(&spooled.dcm_path).map_err(|e| ScuError::ReadFile {
-    path:   spooled.dcm_path.clone(),
-    source: Box::new(e),
-  })?;
+  let file = scu::open_spooled(&spooled.dcm_path)?;
+  let meta = scu::meta_of(&file);
+  let target = config.destination.compression.target_for(&file);
+  ensure_connected(config, log, session, &meta, target).await?;
 
   let assoc = session.assoc.as_mut().ok_or_else(|| ScuError::SessionUnavailable {
     reason: "not connected".into(),
   })?;
+  let (file, meta) = scu::prepare_object(assoc.presentation_contexts(), file, meta, target, log).await;
 
   let attempt = spooled.attempts + 1;
   match scu::send_object(assoc, &file, &meta, log).await {
-    Ok(()) => {
+    Ok(bytes) => {
       if let Err(e) = tokio::task::spawn_blocking({
         let spooled = spooled.clone();
         move || crate::queue::mark_delivered(&spooled)
@@ -142,6 +140,8 @@ async fn process_job(
           "object forwarded";
           "destination" => &config.destination.name,
           "sop_instance_uid" => &meta.sop_instance_uid,
+          "transfer_syntax" => &meta.transfer_syntax,
+          "bytes" => bytes as u64,
           "attempt" => attempt
       );
       Ok(())
@@ -172,16 +172,22 @@ async fn ensure_connected(
   log: &Logger,
   session: &mut SessionState,
   meta: &SpooledMeta,
+  target: Option<&str>,
 ) -> Result<(), ScuError> {
-  let key = (meta.sop_class_uid.clone(), meta.transfer_syntax.clone());
-  if session.assoc.is_some() && session.negotiated.contains(&key) {
+  let keys = scu::presentation_keys_for_meta(meta, target);
+  let proposed = keys.iter().all(|k| {
+    session
+      .negotiated
+      .contains(&(k.abstract_syntax.clone(), k.transfer_syntax.clone()))
+  });
+  if session.assoc.is_some() && proposed {
     return Ok(());
   }
 
   let pcs = if session.negotiated.is_empty() {
-    scu::presentation_keys_for_meta(meta)
+    keys
   } else {
-    scu::merge_presentation_keys(&session.negotiated, meta)?
+    scu::merge_presentation_keys(&session.negotiated, &keys)?
   };
 
   reconnect(config, log, session, pcs).await

@@ -24,6 +24,30 @@ Configuration is validated on every startup (`Config::load` → `validate()`). I
 dicom-router --config /path/to/config.yaml
 ```
 
+## Compression
+
+Per destination, `compression` controls the transfer syntax used on the wire:
+
+| Value | Behaviour |
+|---|---|
+| `none` (default) | Forward objects exactly as received. |
+| `jpeg-xl-lossless` | Re-encode uncompressed little-endian images (8/16-bit, MONOCHROME1/2, PALETTE COLOR, interleaved RGB) as JPEG XL Lossless. Everything else is forwarded unchanged. |
+| `explicit-le` | Decode compressed pixel data to Explicit VR Little Endian. Use on a router in front of a PACS that should not receive JPEG XL. |
+
+The router proposes both the target and the original transfer syntax. It transcodes only when the destination accepts the target, and sends the original if transcoding fails. Every JPEG XL encode is decoded again and compared byte-for-byte with the original pixel data before it is sent.
+
+Typical setup with a router on each side of the link:
+
+```
+Modality → router A (compression: jpeg-xl-lossless) → router B (compression: explicit-le) → PACS
+```
+
+`object forwarded` log lines include `transfer_syntax` and `bytes` (dataset size on the wire). To measure compression on your own data:
+
+```bash
+cargo run --release --example compression_bench -- path/to/*.dcm
+```
+
 ## Logging
 
 JSON lines to stdout, Go `slog`-style fields: `msg`, `level` (`WARN`, `ERROR`, …), `ts` (RFC3339 UTC), plus key-values.

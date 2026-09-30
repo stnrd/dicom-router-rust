@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use snafu::Snafu;
 
+use crate::compression::Compression;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
   /// Address to listen on for inbound DICOM TLS associations, e.g.
@@ -88,6 +90,10 @@ pub struct Destination {
   /// to this destination. Empty = forward everything (fan-out).
   #[serde(default)]
   pub source_ae_titles: Vec<String>,
+  /// Outbound compression: none (default), jpeg-xl-lossless, or explicit-le
+  /// (decompress, for the router in front of a PACS).
+  #[serde(default)]
+  pub compression:      Compression,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -257,6 +263,7 @@ destinations:
     port: 2762
     ca_cert: "tests/certs/ca.crt"
     source_ae_titles: ["MODALITY_1"]
+    compression: jpeg-xl-lossless
 "#;
 
   #[test]
@@ -268,6 +275,8 @@ destinations:
     assert_eq!(cfg.retry.max_attempts, 10);
     assert_eq!(cfg.destinations[1].source_ae_titles, vec!["MODALITY_1"]);
     assert!(cfg.destinations[0].source_ae_titles.is_empty());
+    assert_eq!(cfg.destinations[0].compression, Compression::None);
+    assert_eq!(cfg.destinations[1].compression, Compression::JpegXlLossless);
   }
 
   #[test]

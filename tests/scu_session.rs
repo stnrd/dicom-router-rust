@@ -20,6 +20,7 @@ async fn reuses_one_association_for_many_cstores() {
     client_cert:      None,
     client_key:       None,
     source_ae_titles: vec![],
+    compression:      Default::default(),
   };
 
   let pcs = vec![scu::PresentationKey {
