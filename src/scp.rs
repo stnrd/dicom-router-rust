@@ -6,7 +6,7 @@ use dicom_dictionary_std::uids;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
-use dicom_ul::association::server::{AcceptAny, DefaultNegotiation, ServerAssociationOptions};
+use dicom_ul::association::server::{AcceptAny, Negotiation, ServerAssociationOptions};
 use dicom_ul::association::{Association, AsyncServerAssociation};
 use dicom_ul::pdu::{PDataValue, PDataValueType, PresentationContextResultReason};
 use dicom_ul::Pdu;
@@ -18,7 +18,40 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::dimse::{self, CommandSet, TAG_AFFECTED_SOP_CLASS_UID, TAG_AFFECTED_SOP_INSTANCE_UID, TAG_MESSAGE_ID};
+use crate::qr::{self, QrClient, QrKind};
 use crate::queue::{self, QueueError};
+
+enum Pending {
+  None,
+  Store {
+    msgid:            u16,
+    sop_class_uid:    String,
+    sop_instance_uid: String,
+  },
+  Query {
+    kind:          QrKind,
+    msgid:         u16,
+    sop_class_uid: String,
+    pc_id:         u8,
+  },
+}
+
+#[derive(Clone)]
+struct EchoRoles;
+
+impl Negotiation for EchoRoles {
+  fn negotiate_roles(
+    &self,
+    _sop_class_uid: &str,
+    scu_role: bool,
+    scp_role: bool,
+  ) -> Option<dicom_ul::pdu::RequestorRoles> {
+    Some(dicom_ul::pdu::RequestorRoles {
+      scu: scu_role,
+      scp: scp_role,
+    })
+  }
+}
 
 #[derive(Debug, Snafu)]
 pub enum ScpError {
@@ -74,12 +107,14 @@ pub const ABSTRACT_SYNTAXES: &[&str] = &[
 fn server_options(
   cfg: &Config,
   tls: Option<Arc<rustls::ServerConfig>>,
-) -> ServerAssociationOptions<'static, AcceptAny, DefaultNegotiation> {
+  qr: Option<&QrClient>,
+) -> ServerAssociationOptions<'static, AcceptAny, EchoRoles> {
   let mut options = ServerAssociationOptions::new()
     .accept_any()
     .ae_title(cfg.ae_title.clone())
     .max_pdu_length(cfg.max_pdu_length)
-    .promiscuous(cfg.promiscuous);
+    .promiscuous(cfg.promiscuous)
+    .with_negotiation(EchoRoles);
   if let Some(tls_cfg) = tls {
     options = options.tls_config(tls_cfg);
   }
@@ -91,6 +126,11 @@ fn server_options(
   for uid in ABSTRACT_SYNTAXES {
     options = options.with_abstract_syntax(*uid);
   }
+  if qr.is_some() {
+    for uid in qr::QR_SOP_CLASSES {
+      options = options.with_abstract_syntax(*uid);
+    }
+  }
   options
 }
 
@@ -100,6 +140,7 @@ pub async fn spawn(
   tls: Option<Arc<rustls::ServerConfig>>,
   log: Logger,
   shutdown: CancellationToken,
+  qr: Option<QrClient>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
   let listener = TcpListener::bind(&cfg.listen_addr).await?;
   let inbound_tls = tls.is_some();
@@ -110,7 +151,7 @@ pub async fn spawn(
       "ae_title" => &cfg.ae_title,
       "tls" => inbound_tls
   );
-  let options = server_options(&cfg, tls);
+  let options = server_options(&cfg, tls, qr.as_ref());
   let conn_sem = Arc::new(Semaphore::new(cfg.max_concurrent_associations));
 
   let handle = tokio::spawn(async move {
@@ -138,16 +179,17 @@ pub async fn spawn(
               let conn_log = log.new(o!("peer" => peer_str));
               let cfg = cfg.clone();
               let options = options.clone();
+              let qr = qr.clone();
               connections.spawn(async move {
                   let _permit = permit;
                   if inbound_tls {
                     match options.establish_tls_async(stream).await {
-                      Ok(association) => serve(association, &cfg, &conn_log).await,
+                      Ok(association) => serve(association, &cfg, qr, &conn_log).await,
                       Err(e) => debug!(conn_log, "association rejected"; "error" => %e),
                     }
                   } else {
                     match options.establish_async(stream).await {
-                      Ok(association) => serve(association, &cfg, &conn_log).await,
+                      Ok(association) => serve(association, &cfg, qr, &conn_log).await,
                       Err(e) => debug!(conn_log, "association rejected"; "error" => %e),
                     }
                   }
@@ -161,7 +203,7 @@ pub async fn spawn(
   Ok(handle)
 }
 
-async fn serve<S>(association: AsyncServerAssociation<S>, cfg: &Config, conn_log: &Logger)
+async fn serve<S>(association: AsyncServerAssociation<S>, cfg: &Config, qr: Option<QrClient>, conn_log: &Logger)
 where
   S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -176,20 +218,23 @@ where
           .filter(|pc| pc.reason == PresentationContextResultReason::Acceptance)
           .count() as u64
   );
-  if let Err(e) = handle_association(association, cfg, alog.clone()).await {
+  if let Err(e) = handle_association(association, cfg, qr, alog.clone()).await {
     warn!(alog, "association ended with error"; "error" => %e);
   }
   info!(alog, "association closed");
 }
 
-async fn handle_association<S>(mut association: AsyncServerAssociation<S>, cfg: &Config, log: Logger) -> Result<()>
+async fn handle_association<S>(
+  mut association: AsyncServerAssociation<S>,
+  cfg: &Config,
+  qr: Option<QrClient>,
+  log: Logger,
+) -> Result<()>
 where
   S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-  let mut instance_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
-  let mut msgid: u16 = 1;
-  let mut sop_class_uid = String::new();
-  let mut sop_instance_uid = String::new();
+  let mut dataset_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
+  let mut pending = Pending::None;
 
   loop {
     let pdu = match association.receive().await {
@@ -205,7 +250,7 @@ where
       Pdu::PData { mut data } =>
         for data_value in &mut data {
           if data_value.value_type == PDataValueType::Data && !data_value.is_last {
-            instance_buffer.append(&mut data_value.data);
+            dataset_buffer.append(&mut data_value.data);
           } else if data_value.value_type == PDataValueType::Command && data_value.is_last {
             let obj = match dimse::decode_command(&data_value.data) {
               Ok(o) => o,
@@ -216,18 +261,34 @@ where
             };
             let command_field = dimse::command_field(&obj).unwrap_or(0);
             if command_field == dimse::C_ECHO_RQ {
-              msgid = dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0);
+              let msgid = dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0);
               let rsp = dimse::create_cecho_rsp(msgid, dimse::STATUS_SUCCESS);
               send_command(&mut association, &rsp, data_value.presentation_context_id).await?;
             } else if command_field == dimse::C_STORE_RQ {
-              msgid = dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0);
-              sop_class_uid = dimse::string(&obj, TAG_AFFECTED_SOP_CLASS_UID)
-                .unwrap_or("")
-                .to_string();
-              sop_instance_uid = dimse::string(&obj, TAG_AFFECTED_SOP_INSTANCE_UID)
-                .unwrap_or("")
-                .to_string();
-              instance_buffer.clear();
+              pending = Pending::Store {
+                msgid:            dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0),
+                sop_class_uid:    dimse::string(&obj, TAG_AFFECTED_SOP_CLASS_UID)
+                  .unwrap_or("")
+                  .to_string(),
+                sop_instance_uid: dimse::string(&obj, TAG_AFFECTED_SOP_INSTANCE_UID)
+                  .unwrap_or("")
+                  .to_string(),
+              };
+              dataset_buffer.clear();
+            } else if command_field == dimse::C_FIND_RQ || command_field == dimse::C_GET_RQ {
+              pending = Pending::Query {
+                kind:          if command_field == dimse::C_FIND_RQ {
+                  QrKind::Find
+                } else {
+                  QrKind::Get
+                },
+                msgid:         dimse::uint16(&obj, TAG_MESSAGE_ID).unwrap_or(0),
+                sop_class_uid: dimse::string(&obj, TAG_AFFECTED_SOP_CLASS_UID)
+                  .unwrap_or("")
+                  .to_string(),
+                pc_id:         data_value.presentation_context_id,
+              };
+              dataset_buffer.clear();
             } else {
               warn!(
                   log,
@@ -236,30 +297,79 @@ where
               );
             }
           } else if data_value.value_type == PDataValueType::Data && data_value.is_last {
-            instance_buffer.append(&mut data_value.data);
-            let status = match store_instance(
-              cfg,
-              &association,
-              data_value.presentation_context_id,
-              &instance_buffer,
-              &log,
-            )
-            .await
-            {
-              Ok(()) => dimse::STATUS_SUCCESS,
-              Err(e) => {
-                error!(
-                    log,
-                    "failed to spool object";
-                    "sop_instance_uid" => &sop_instance_uid,
-                    "error" => %e
-                );
-                dimse::STATUS_OUT_OF_RESOURCES
+            dataset_buffer.append(&mut data_value.data);
+            match std::mem::replace(&mut pending, Pending::None) {
+              Pending::Store {
+                msgid,
+                sop_class_uid,
+                sop_instance_uid,
+              } => {
+                let status = match store_instance(
+                  cfg,
+                  &association,
+                  data_value.presentation_context_id,
+                  &dataset_buffer,
+                  &log,
+                )
+                .await
+                {
+                  Ok(()) => dimse::STATUS_SUCCESS,
+                  Err(e) => {
+                    error!(
+                        log,
+                        "failed to spool object";
+                        "sop_instance_uid" => &sop_instance_uid,
+                        "error" => %e
+                    );
+                    dimse::STATUS_OUT_OF_RESOURCES
+                  }
+                };
+                dataset_buffer.clear();
+                let rsp = dimse::create_cstore_rsp(msgid, &sop_class_uid, &sop_instance_uid, status);
+                send_command(&mut association, &rsp, data_value.presentation_context_id).await?;
               }
-            };
-            instance_buffer.clear();
-            let rsp = dimse::create_cstore_rsp(msgid, &sop_class_uid, &sop_instance_uid, status);
-            send_command(&mut association, &rsp, data_value.presentation_context_id).await?;
+              Pending::Query {
+                kind,
+                msgid,
+                sop_class_uid,
+                pc_id,
+              } => {
+                let identifier = std::mem::take(&mut dataset_buffer);
+                let peer_ae = association.peer_ae_title().to_string();
+                let status = match qr.as_ref() {
+                  None => Some(dimse::STATUS_SOP_CLASS_NOT_SUPPORTED),
+                  Some(qr_client) if !qr_client.allows(&peer_ae) => {
+                    warn!(log, "query/retrieve refused: calling AE title not allowed"; "operation" => ?kind);
+                    Some(dimse::STATUS_NOT_AUTHORIZED)
+                  }
+                  Some(qr_client) => {
+                    let req = qr::QrProxyRequest {
+                      kind,
+                      inbound_pc_id: pc_id,
+                      inbound_msgid: msgid,
+                      sop_class_uid: &sop_class_uid,
+                      identifier: &identifier,
+                      calling_ae_title: &cfg.ae_title,
+                      max_pdu_length: cfg.max_pdu_length,
+                    };
+                    match qr::proxy(&mut association, &req, qr_client, &log).await {
+                      Ok(()) => None,
+                      Err(e) => {
+                        warn!(log, "query/retrieve proxy failed"; "operation" => ?kind, "error" => %e);
+                        Some(dimse::STATUS_OUT_OF_RESOURCES)
+                      }
+                    }
+                  }
+                };
+                if let Some(status) = status {
+                  let _ = qr::refuse(&mut association, kind, pc_id, msgid, &sop_class_uid, status).await;
+                }
+              }
+              Pending::None => {
+                dataset_buffer.clear();
+                warn!(log, "unexpected data PDU with no pending command");
+              }
+            }
           }
         },
       Pdu::ReleaseRQ => {
