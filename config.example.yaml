@@ -37,6 +37,7 @@ destinations:
     port: 2762
     tls: true
     ca_cert: "/etc/dicom-router/tls/pacs-ca.crt"
+    # source_ae_titles: ["CT_SCANNER_1"]  # optional filter by calling AE
 
   # Example cleartext destination (e.g. local Orthanc on 4242):
   # - name: orthanc
@@ -44,4 +45,3 @@ destinations:
   #   host: "127.0.0.1"
   #   port: 4242
   #   tls: false
-    # source_ae_titles: ["CT_SCANNER_1"]  # optional filter by calling AE
