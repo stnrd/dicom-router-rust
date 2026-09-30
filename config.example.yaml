@@ -17,6 +17,7 @@ retry:
   max_attempts: 10
 
 tls:
+  enabled: true   # false = cleartext inbound (typical port 104)
   server_cert: "/etc/dicom-router/tls/server.crt"
   server_key: "/etc/dicom-router/tls/server.key"
   # client_ca: "/etc/dicom-router/tls/ca.crt"  # enable inbound mTLS
@@ -26,6 +27,7 @@ destinations:
     ae_title: "PACS_MAIN"
     host: "pacs.dicom.svc.cluster.local"
     port: 2762
+    tls: true
     server_name: "pacs.example.org"
     ca_cert: "/etc/dicom-router/tls/pacs-ca.crt"
 
@@ -33,5 +35,13 @@ destinations:
     ae_title: "PACS_BACKUP"
     host: "pacs-backup.dicom.svc.cluster.local"
     port: 2762
+    tls: true
     ca_cert: "/etc/dicom-router/tls/pacs-ca.crt"
     # source_ae_titles: ["CT_SCANNER_1"]  # optional filter by calling AE
+
+  # Example cleartext destination (e.g. local Orthanc on 4242):
+  # - name: orthanc
+  #   ae_title: "ORTHANC"
+  #   host: "127.0.0.1"
+  #   port: 4242
+  #   tls: false

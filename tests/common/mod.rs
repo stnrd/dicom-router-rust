@@ -137,6 +137,94 @@ pub async fn start_test_scp(server_cert: &Path, server_key: &Path) -> TestScp {
   }
 }
 
+/// In-process cleartext C-STORE SCP (no TLS) that records received SOP Instance
+/// UIDs.
+pub async fn start_test_scp_plain() -> TestScp {
+  use dicom_ul::association::server::ServerAssociationOptions;
+  use dicom_ul::pdu::{PDataValue, PDataValueType};
+  use dicom_ul::Pdu;
+
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    .await
+    .expect("bind test SCP");
+  let port = listener.local_addr().unwrap().port();
+  let received = Arc::new(Mutex::new(Vec::new()));
+  let received2 = received.clone();
+  let association_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+  let association_count2 = association_count.clone();
+
+  let handle = tokio::spawn(async move {
+    loop {
+      let (stream, _) = listener.accept().await.expect("accept");
+      let received = received2.clone();
+      let association_count = association_count2.clone();
+      tokio::spawn(async move {
+        let options = ServerAssociationOptions::new()
+          .accept_any()
+          .ae_title("TEST-DEST")
+          .promiscuous(true);
+        let mut assoc = options.establish_async(stream).await.expect("assoc");
+        association_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut msgid = 1u16;
+        let mut class = String::new();
+        let mut inst = String::new();
+        loop {
+          match assoc.receive().await {
+            Ok(Pdu::PData { mut data }) =>
+              for dv in &mut data {
+                if dv.value_type == PDataValueType::Command && dv.is_last {
+                  let cmd = dicom_router::dimse::decode_command(&dv.data).unwrap();
+                  if dicom_router::dimse::command_field(&cmd).unwrap() == dicom_router::dimse::C_STORE_RQ {
+                    msgid = dicom_router::dimse::uint16(&cmd, dicom_router::dimse::TAG_MESSAGE_ID).unwrap();
+                    class = dicom_router::dimse::string(&cmd, dicom_router::dimse::TAG_AFFECTED_SOP_CLASS_UID)
+                      .unwrap()
+                      .to_string();
+                    inst = dicom_router::dimse::string(&cmd, dicom_router::dimse::TAG_AFFECTED_SOP_INSTANCE_UID)
+                      .unwrap()
+                      .to_string();
+                    buf.clear();
+                  }
+                } else if dv.value_type == PDataValueType::Data {
+                  buf.append(&mut dv.data);
+                  if dv.is_last {
+                    received.lock().unwrap().push(inst.clone());
+                    let rsp =
+                      dicom_router::dimse::create_cstore_rsp(msgid, &class, &inst, dicom_router::dimse::STATUS_SUCCESS);
+                    let data = dicom_router::dimse::encode_command(&rsp);
+                    assoc
+                      .send(&Pdu::PData {
+                        data: vec![PDataValue {
+                          presentation_context_id: dv.presentation_context_id,
+                          value_type: PDataValueType::Command,
+                          is_last: true,
+                          data,
+                        }],
+                      })
+                      .await
+                      .unwrap();
+                  }
+                }
+              },
+            Ok(Pdu::ReleaseRQ) => {
+              let _ = assoc.send(&Pdu::ReleaseRP).await;
+              break;
+            }
+            _ => break,
+          }
+        }
+      });
+    }
+  });
+
+  TestScp {
+    port,
+    received,
+    association_count,
+    _handle: handle,
+  }
+}
+
 /// An in-memory CA plus one server and one client leaf certificate, all
 /// PEM-encoded.
 pub struct Pki {

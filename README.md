@@ -1,6 +1,6 @@
 # DICOM Router (Rust)
 
-Production-grade, TLS-only DICOM C-STORE router. Receives DICOM over TLS, durably spools to disk, and forwards to one or more destinations over verified TLS.
+Production-grade DICOM C-STORE router. Durable spool-and-forward with TLS on by default; cleartext DICOM can be enabled per direction for lab or legacy PACS (e.g. Orthanc on port 4242).
 
 ## Architecture
 
@@ -8,8 +8,8 @@ Production-grade, TLS-only DICOM C-STORE router. Receives DICOM over TLS, durabl
 Modality (TLS) → Router SCP → spool queue → Dispatcher → Router SCU (TLS) → PACS
 ```
 
-- **Inbound:** TLS SCP (port 2762 by default). Optional inbound mTLS via `tls.client_ca`.
-- **Outbound:** Always TLS with CA verification. Optional client cert per destination.
+- **Inbound:** TLS SCP by default (port 2762). Set `tls.enabled: false` for cleartext (port 104). Optional inbound mTLS via `tls.client_ca`.
+- **Outbound:** TLS with CA verification by default (`destinations[].tls: true`). Set `tls: false` for cleartext destinations. Optional client cert per TLS destination.
 - **Durability:** C-STORE-RSP success is sent only after atomic spool to disk.
 - **Routing:** Fan-out to all destinations; optional `source_ae_titles` filter per destination.
 - **Atomic fan-out:** C-STORE-RSP success is sent only after the object is durably spooled to *all* matching destination queues; a failure on any destination rolls back the others.
