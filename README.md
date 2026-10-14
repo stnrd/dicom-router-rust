@@ -1,6 +1,6 @@
 # DICOM Router (Rust)
 
-A small, durable DICOM router. Modalities send images to the router; the router stores each image safely on disk and forwards it to one or more PACS, retrying until it gets through. Optionally it also lets viewers query and retrieve studies from a PACS through the same endpoint.
+DICOM router supporting reliable image forwarding to one or more PACS, query/retrieve for viewers, and secure transport over DICOM TLS.
 
 ```
                          ┌──────────────── dicom-router ────────────────┐
