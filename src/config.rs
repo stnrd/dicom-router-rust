@@ -43,6 +43,10 @@ pub struct Config {
   pub tls:                         ServerTls,
   /// Forwarding destinations (at least one).
   pub destinations:                Vec<Destination>,
+  /// When set, inbound C-FIND / C-GET (Patient Root and Study Root) are
+  /// proxied to this destination (must match `destinations[].name`).
+  #[serde(default)]
+  pub query_retrieve:              Option<QueryRetrieveConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +92,16 @@ pub struct Destination {
   /// to this destination. Empty = forward everything (fan-out).
   #[serde(default)]
   pub source_ae_titles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueryRetrieveConfig {
+  /// `destinations[].name` used for C-FIND / C-GET outbound.
+  pub destination:       String,
+  /// Calling AE titles allowed to query/retrieve. Required and non-empty:
+  /// the proxy exposes the destination's archive, so access is opt-in.
+  #[serde(default)]
+  pub allowed_ae_titles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -194,6 +208,22 @@ impl Config {
         )));
       }
     }
+    if let Some(qr) = &self.query_retrieve {
+      if qr.destination.is_empty() {
+        return Err(invalid("query_retrieve.destination must not be empty".into()));
+      }
+      if qr.allowed_ae_titles.is_empty() {
+        return Err(invalid(
+          "query_retrieve.allowed_ae_titles must list the calling AE titles allowed to query".into(),
+        ));
+      }
+      if !self.destinations.iter().any(|d| d.name == qr.destination) {
+        return Err(invalid(format!(
+          "query_retrieve.destination {:?} does not match any destinations[].name",
+          qr.destination
+        )));
+      }
+    }
     if self.max_pdu_length < 1_018 {
       return Err(invalid("max_pdu_length must be >= 1018".into()));
     }
@@ -231,6 +261,11 @@ impl Config {
       .iter()
       .filter(|d| d.source_ae_titles.is_empty() || d.source_ae_titles.iter().any(|t| t == calling_ae))
       .collect()
+  }
+
+  pub fn qr_destination(&self) -> Option<&Destination> {
+    let name = &self.query_retrieve.as_ref()?.destination;
+    self.destinations.iter().find(|d| d.name == *name)
   }
 }
 
@@ -400,6 +435,39 @@ destinations: []
       .map(|d| d.name.as_str())
       .collect();
     assert_eq!(for_other, vec!["pacs-main"]);
+  }
+
+  #[test]
+  fn qr_destination_resolves_named_dest() {
+    let yaml =
+      VALID_YAML.to_string() + "query_retrieve:\n  destination: pacs-main\n  allowed_ae_titles: [\"VIEWER\"]\n";
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(cfg.qr_destination().unwrap().name, "pacs-main");
+  }
+
+  #[test]
+  fn qr_destination_unknown_name_is_invalid() {
+    let yaml =
+      VALID_YAML.to_string() + "query_retrieve:\n  destination: no-such-dest\n  allowed_ae_titles: [\"VIEWER\"]\n";
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("query_retrieve.destination"));
+  }
+
+  #[test]
+  fn qr_requires_allowed_ae_titles() {
+    let yaml = VALID_YAML.to_string() + "query_retrieve:\n  destination: pacs-main\n";
+    let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("allowed_ae_titles"));
+  }
+
+  #[test]
+  fn qr_omitted_means_no_proxy() {
+    let cfg: Config = serde_yaml::from_str(VALID_YAML).unwrap();
+    cfg.validate().unwrap();
+    assert!(cfg.qr_destination().is_none());
   }
 
   #[test]

@@ -45,3 +45,9 @@ destinations:
   #   host: "127.0.0.1"
   #   port: 4242
   #   tls: false
+
+# Optional: proxy inbound C-FIND / C-GET (Patient Root and Study Root) to this
+# destination. Omit the whole block to keep C-STORE/C-ECHO-only behaviour.
+# query_retrieve:
+#   destination: pacs-main
+#   allowed_ae_titles: ["VIEWER"]  # required; everyone else is refused

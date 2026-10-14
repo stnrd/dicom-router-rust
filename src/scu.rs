@@ -24,6 +24,17 @@ pub struct PresentationKey {
   pub transfer_syntax: String,
 }
 
+/// Presentation contexts to propose: abstract syntax plus the transfer
+/// syntaxes offered for it, in preference order.
+pub type PresentationKeys = Vec<(String, Vec<String>)>;
+
+#[derive(Debug, Clone)]
+pub struct RoleSelection {
+  pub sop_class: String,
+  pub scu:       bool,
+  pub scp:       bool,
+}
+
 /// Outbound association over TLS or cleartext TCP, depending on destination
 /// config.
 pub enum ClientAssoc {
@@ -57,6 +68,13 @@ impl ClientAssoc {
     match self {
       Self::Tls(a) => a.receive().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
       Self::Plain(a) => a.receive().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
+    }
+  }
+
+  pub async fn abort(self) -> Result<(), ScuError> {
+    match self {
+      Self::Tls(a) => a.abort().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
+      Self::Plain(a) => a.abort().await.map_err(|e| ScuError::Io { source: Box::new(e) }),
     }
   }
 }
@@ -136,6 +154,21 @@ pub async fn connect(
   max_pdu_length: u32,
   pcs: &[PresentationKey],
 ) -> Result<ClientAssoc, ScuError> {
+  let pcs: PresentationKeys = pcs
+    .iter()
+    .map(|pc| (pc.abstract_syntax.clone(), vec![pc.transfer_syntax.clone()]))
+    .collect();
+  connect_with_roles(destination, client_tls, calling_ae_title, max_pdu_length, &pcs, &[]).await
+}
+
+pub async fn connect_with_roles(
+  destination: &Destination,
+  client_tls: Option<Arc<rustls::ClientConfig>>,
+  calling_ae_title: &str,
+  max_pdu_length: u32,
+  pcs: &[(String, Vec<String>)],
+  roles: &[RoleSelection],
+) -> Result<ClientAssoc, ScuError> {
   let ae_address = format!("{}@{}:{}", destination.ae_title, destination.host, destination.port);
 
   let mut options = ClientAssociationOptions::new()
@@ -143,8 +176,11 @@ pub async fn connect(
     .called_ae_title(destination.ae_title.clone())
     .max_pdu_length(max_pdu_length);
 
-  for pc in pcs {
-    options = options.with_presentation_context(pc.abstract_syntax.clone(), vec![pc.transfer_syntax.clone()]);
+  for (abstract_syntax, transfer_syntaxes) in pcs {
+    options = options.with_presentation_context(abstract_syntax.clone(), transfer_syntaxes.clone());
+  }
+  for role in roles {
+    options = options.with_role_selection(role.sop_class.clone(), role.scu, role.scp);
   }
 
   if destination.tls {
@@ -163,7 +199,7 @@ pub async fn connect(
         ae_address: ae_address.clone(),
         source:     Box::new(e),
       })
-      .map(|a| ClientAssoc::Tls(Box::new(a)))
+      .map(|assoc| ClientAssoc::Tls(Box::new(assoc)))
   } else {
     options
       .establish_with_async(&ae_address)
@@ -172,7 +208,7 @@ pub async fn connect(
         ae_address: ae_address.clone(),
         source:     Box::new(e),
       })
-      .map(|a| ClientAssoc::Plain(Box::new(a)))
+      .map(|assoc| ClientAssoc::Plain(Box::new(assoc)))
   }
 }
 

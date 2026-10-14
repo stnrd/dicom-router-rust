@@ -5,6 +5,7 @@ pub mod dimse;
 pub mod dispatcher;
 pub mod logging;
 pub mod outbound_session;
+pub mod qr;
 pub mod queue;
 pub mod retry;
 pub mod scp;
@@ -102,7 +103,49 @@ async fn async_main(cfg: config::Config, log: slog::Logger) -> i32 {
     }
   }
 
-  let scp_handle = match scp::spawn(cfg.clone(), server_tls, log.clone(), shutdown.clone()).await {
+  let qr = match cfg.qr_destination() {
+    Some(dest) => {
+      let client_tls = if dest.tls {
+        match tls::build_client_config(
+          dest.ca_cert.as_ref().expect("validated"),
+          dest.client_cert.as_deref(),
+          dest.client_key.as_deref(),
+        ) {
+          Ok(c) => Some(c),
+          Err(e) => {
+            error!(
+                log,
+                "failed to build QR client TLS config";
+                "destination" => &dest.name,
+                "error" => %e
+            );
+            return 2;
+          }
+        }
+      } else {
+        None
+      };
+      let allowed_ae_titles = cfg
+        .query_retrieve
+        .as_ref()
+        .map(|q| q.allowed_ae_titles.clone())
+        .unwrap_or_default();
+      info!(
+          log,
+          "query/retrieve proxy enabled";
+          "destination" => &dest.name,
+          "allowed_ae_titles" => allowed_ae_titles.join(",")
+      );
+      Some(qr::QrClient {
+        destination: dest.clone(),
+        client_tls,
+        allowed_ae_titles,
+      })
+    }
+    None => None,
+  };
+
+  let scp_handle = match scp::spawn(cfg.clone(), server_tls, log.clone(), shutdown.clone(), qr).await {
     Ok(h) => h,
     Err(e) => {
       error!(

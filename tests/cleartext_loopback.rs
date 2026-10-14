@@ -42,7 +42,9 @@ destinations:
 
   let token = CancellationToken::new();
   let log = slog::Logger::root(slog::Discard, slog::o!());
-  let _scp = scp::spawn(cfg.clone(), None, log.clone(), token.clone()).await.unwrap();
+  let _scp = scp::spawn(cfg.clone(), None, log.clone(), token.clone(), None)
+    .await
+    .unwrap();
   let _disp = dispatcher::spawn(dispatcher::WorkerConfig {
     destination:          cfg.destinations[0].clone(),
     client_tls:           None,
