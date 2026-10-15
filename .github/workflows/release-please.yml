@@ -1,0 +1,45 @@
+name: Release Please
+
+# Keeps a "Release PR" open on main that bumps Cargo.toml / Cargo.lock and
+# updates CHANGELOG.md from conventional commits (feat:, fix:, ...). Merging
+# that PR creates the tag and GitHub Release, then runs release.yml.
+#
+# Tags created with GITHUB_TOKEN do not trigger other workflows, so
+# release.yml is called directly instead of reacting to the tag push.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+  id-token: write
+  security-events: write
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release PR
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  release:
+    name: Release
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
