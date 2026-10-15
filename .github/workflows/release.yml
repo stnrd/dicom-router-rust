@@ -1,47 +1,363 @@
 name: Release
 
+# Final releases (v1.2.3): lint + test, version check, multi-arch image, smoke
+# test and Trivy scan, then publish the image (1.2.3, 1.2, 1, latest), sign it
+# and attach static binaries + SBOM to the GitHub Release.
+#
+# Release candidates (v1.2.3-rc1, any tag with a "-"): build the multi-arch
+# image and push it as 1.2.3-rc1. Nothing else.
+#
+# Started by release-please.yml when its Release PR is merged, or by pushing a
+# tag by hand (needed for release candidates).
+
 on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to release, e.g. v1.2.3
+        required: true
+        type: string
 
 permissions:
-  contents: read
-  packages: write
+  contents: write        # upload release assets
+  packages: write        # push to GHCR
+  id-token: write        # keyless cosign signing
+  security-events: write # Trivy results in the Security tab
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  TAG: ${{ inputs.tag || github.ref_name }}
+  IMAGE: ghcr.io/${{ github.repository }}
+  # Set to "true" to fail the release on CRITICAL vulnerabilities that have a
+  # fix available. When "false", Trivy only reports.
+  TRIVY_BLOCKING: "false"
 
 jobs:
-  publish:
-    name: Build and push image
+  meta:
+    name: Release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - id: meta
+        run: |
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---- Gates (final releases only) ------------------------------------------
+
+  ci:
+    name: CI
+    needs: meta
+    if: needs.meta.outputs.prerelease == 'false'
+    uses: ./.github/workflows/ci.yml
+
+  version-check:
+    name: Tag matches Cargo.toml
+    needs: meta
+    if: needs.meta.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - name: Compare versions
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "$cargo_version" != "${{ needs.meta.outputs.version }}" ]]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
+  # ---- Image ----------------------------------------------------------------
+
+  # Build each architecture on a native runner (no QEMU) and push it by digest
+  # only. Tags are added in `publish`, after the checks below have passed.
+  image:
+    name: Image (${{ matrix.arch }})
+    needs: [meta, ci, version-check]
+    # ci and version-check are skipped for release candidates.
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # SBOM and provenance attestations for final releases only.
+          sbom: ${{ needs.meta.outputs.prerelease == 'false' }}
+          provenance: ${{ needs.meta.outputs.prerelease == 'false' && 'mode=max' || 'false' }}
+
+      - name: Save digest
+        run: |
+          mkdir -p digests
+          echo "${{ steps.build.outputs.digest }}" > "digests/${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          retention-days: 1
+
+  # ---- Checks on the built image (final releases only) ----------------------
+
+  smoke-test:
+    name: Smoke test
+    needs: [meta, image]
+    if: needs.meta.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: digest-amd64
+          path: digests
+
+      - name: Install DCMTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dcmtk
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: C-ECHO, C-STORE, C-FIND, C-GET against Orthanc
+        run: scripts/smoke-test.sh "$IMAGE@$(cat digests/amd64)"
+
+  scan:
+    name: Trivy scan
+    needs: [meta, image]
+    if: needs.meta.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: digest-amd64
+          path: digests
+
+      - name: Image reference
+        run: echo "SCAN_REF=$IMAGE@$(cat digests/amd64)" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pinned to a commit: this action had a script-injection advisory in
+      # 2026 and its tags are mutable.
+      # Full report for the Security tab. Never fails the job.
+      - name: Scan (SARIF)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.SCAN_REF }}
+          format: sarif
+          output: trivy.sarif
+          exit-code: "0"
+
+      - name: Upload to Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        continue-on-error: true
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      # Readable summary on the run page. Fails the release only when
+      # TRIVY_BLOCKING is "true".
+      - name: Scan (summary)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.SCAN_REF }}
+          format: table
+          output: trivy.txt
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: ${{ env.TRIVY_BLOCKING == 'true' && '1' || '0' }}
+          skip-setup-trivy: true
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "### Trivy: fixable CRITICAL vulnerabilities (blocking: $TRIVY_BLOCKING)"
+            echo '```'
+            cat trivy.txt 2>/dev/null || echo "no report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- Publish --------------------------------------------------------------
+
+  publish:
+    name: Publish image
+    needs: [meta, image, smoke-test, scan]
+    # smoke-test and scan are skipped for release candidates.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Final: 1.2.3, 1.2, 1 (not for 0.x) and latest. RC: 1.2.3-rc1 only.
+      - name: Tags
+        id: tags
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=semver,pattern={{major}},value=${{ env.TAG }},enable=${{ !startsWith(env.TAG, 'v0.') }}
+            type=raw,value=latest,enable=${{ needs.meta.outputs.prerelease == 'false' }}
+
+      - name: Create multi-arch image and push tags
+        id: push
+        run: |
+          mapfile -t tags < <(jq -r '.tags[] | "-t", .' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          mapfile -t sources < <(sed "s|^|$IMAGE@|" digests/*)
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          digest="$(docker buildx imagetools inspect "$IMAGE:${{ needs.meta.outputs.version }}" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Published \`$IMAGE:${{ needs.meta.outputs.version }}\` (\`$digest\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install cosign
+        if: needs.meta.outputs.prerelease == 'false'
+        uses: sigstore/cosign-installer@v4
+
+      # Keyless signature using this workflow's GitHub OIDC identity.
+      - name: Sign image
+        if: needs.meta.outputs.prerelease == 'false'
+        run: cosign sign --yes "$IMAGE@${{ steps.push.outputs.digest }}"
+
+  # ---- Binaries and GitHub Release (final releases only) --------------------
+
+  binaries:
+    name: Binary (${{ matrix.target }})
+    needs: [meta, ci, version-check]
+    if: ${{ !failure() && !cancelled() && needs.meta.outputs.prerelease == 'false' }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+
+      # Fully static binary: runs on any Linux distribution.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          name="dicom-router-${{ needs.meta.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/dicom-router" README.md LICENSE config.example.yaml "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz
+          retention-days: 1
+
+  github-release:
+    name: GitHub Release assets
+    needs: [meta, publish, binaries]
+    if: ${{ !failure() && !cancelled() && needs.meta.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+
+      - name: SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ needs.publish.outputs.digest }}
+          format: cyclonedx-json
+          output-file: dist/dicom-router-${{ needs.meta.outputs.version }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS
+
+      # release-please already created the Release; for a hand-pushed tag,
+      # create it here with generated notes.
+      - name: Upload to GitHub Release
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$TAG"
+          fi
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

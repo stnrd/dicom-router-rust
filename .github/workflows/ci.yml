@@ -2,7 +2,12 @@ name: CI
 
 on:
   pull_request:
+  # Branches only: version tags are handled by release.yml, which runs these
+  # jobs itself for final releases and skips them for release candidates.
   push:
+    branches: ["**"]
+  # Called by release.yml to gate final releases.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
