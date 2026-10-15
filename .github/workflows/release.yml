@@ -274,7 +274,7 @@ jobs:
 
       - name: Install cosign
         if: needs.meta.outputs.prerelease == 'false'
-        uses: sigstore/cosign-installer@v4
+        uses: sigstore/cosign-installer@v4.1.2
 
       # Keyless signature using this workflow's GitHub OIDC identity.
       - name: Sign image
