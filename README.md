@@ -25,6 +25,35 @@ DICOM router supporting reliable image forwarding to one or more PACS, query/ret
 
 Not supported: C-MOVE (it requires the PACS to connect back to the caller), worklist, and storage commitment.
 
+## Install
+
+**Container image** (Linux `amd64` and `arm64`), from the GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/stnrd/dicom-router-rust:latest
+```
+
+Use a version tag such as `0.2.0` to pin a release. Mount your config at `/etc/dicom-router/config.yaml` and publish the port you set in `listen_addr`:
+
+```bash
+docker run -d --name dicom-router -p 2762:2762 \
+  -v "$PWD/config.yaml:/etc/dicom-router/config.yaml:ro" \
+  -v dicom-router-data:/var/lib/dicom-router \
+  ghcr.io/stnrd/dicom-router-rust:latest
+```
+
+**Binary**: static Linux builds (`x86_64` and `aarch64`, no dependencies) are attached to each [GitHub release](https://github.com/stnrd/dicom-router-rust/releases/latest), together with `SHA256SUMS`:
+
+```bash
+tar xzf dicom-router-<version>-x86_64-unknown-linux-musl.tar.gz
+cd dicom-router-<version>-x86_64-unknown-linux-musl
+./dicom-router --config config.example.yaml   # edit the config and its certificate paths first
+```
+
+The archive contains the `dicom-router` binary, `config.example.yaml`, `README.md` and `LICENSE`.
+
+**From source**: see [Development](#development).
+
 ## Quick start
 
 Try it locally against [Orthanc](https://www.orthanc-server.com/), all in cleartext. You need Docker and the [DCMTK](https://dicom.offis.de/dcmtk) tools (`storescu`, `findscu`, `getscu`).
@@ -38,7 +67,6 @@ docker run -d --name orthanc --network dicom -p 8042:8042 \
   -e ORTHANC__DICOM_MODALITIES='{"router": ["ROUTER", "router", 11112]}' \
   orthancteam/orthanc
 
-docker build -t dicom-router .
 ```
 
 The two Orthanc settings are for local testing only. They turn off the web UI login and register the router, so Orthanc accepts its queries and retrievals.
@@ -69,7 +97,7 @@ query_retrieve:
 ```bash
 docker run -d --name router --network dicom -p 11112:11112 \
   -v "$PWD/quickstart.yaml:/etc/dicom-router/config.yaml:ro" \
-  dicom-router
+  ghcr.io/stnrd/dicom-router-rust:latest
 ```
 
 **2. Send, query, retrieve**
@@ -188,33 +216,6 @@ The integration tests in [`tests/`](tests) run the whole router in-process again
 **CI**: GitHub Actions runs `task lint` and `task test` on every branch push and pull request. See [`.github/workflows`](.github/workflows).
 
 `scripts/smoke-test.sh <image>` runs the router image against Orthanc and checks C-ECHO, C-STORE, C-FIND and C-GET end to end. It needs Docker and DCMTK.
-
-## Releases
-
-Versions follow [semantic versioning](https://semver.org) and are derived from [conventional commits](https://www.conventionalcommits.org) (`feat:`, `fix:`, `feat!:` …).
-
-**Final release**
-1. [release-please](https://github.com/googleapis/release-please) keeps a *Release PR* open on `main`. It bumps the version in `Cargo.toml` and `Cargo.lock` and updates `CHANGELOG.md`.
-2. Merging that PR creates the tag `vX.Y.Z` and the GitHub Release, then runs the release workflow:
-   - lint, tests, and a check that the tag matches `Cargo.toml`;
-   - an image built for `linux/amd64` and `linux/arm64`;
-   - the smoke test and a Trivy scan against that image;
-   - the image published to `ghcr.io/stnrd/dicom-router-rust` as `X.Y.Z`, `X.Y`, `X` (from 1.0) and `latest`, with SBOM and provenance attestations and a keyless cosign signature;
-   - static Linux binaries (x86_64 and aarch64), a CycloneDX SBOM and `SHA256SUMS` attached to the GitHub Release.
-
-**Release candidate**
-
-Push a tag such as `v1.3.0-rc1` by hand. Only the multi-arch image is built and pushed, as `1.3.0-rc1`. There is no lint, test, scan or GitHub Release, and `latest` does not move.
-
-**Trivy** reports by default and does not block a release. Results show on the workflow run and in the repository's Security tab. Set `TRIVY_BLOCKING: "true"` in [`release.yml`](.github/workflows/release.yml) to fail releases with fixable CRITICAL vulnerabilities.
-
-**Verify an image**
-
-```bash
-cosign verify ghcr.io/stnrd/dicom-router-rust:X.Y.Z \
-  --certificate-identity-regexp 'https://github.com/stnrd/dicom-router-rust/.github/workflows/release.yml@.*' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-```
 
 ## License
 
